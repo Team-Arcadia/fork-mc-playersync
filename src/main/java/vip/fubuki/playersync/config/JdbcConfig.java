@@ -172,6 +172,8 @@ public class JdbcConfig {
                 "Top-level keys of the persistent-data tag that must NOT be synchronized.",
                 "Use for world-bound values (saved home positions, per-world cooldowns) that would",
                 "be meaningless or harmful on another server. Exact key names, case sensitive.",
+                "A dotted entry names a nested key, e.g. \"PlayerPersisted.WaystonesData\"",
+                "(known waystones only exist in the world that created them).",
                 "Example: [\"mymod_home_pos\", \"mymod_last_death\"]")
                 .define("persistent_data_blacklist", new ArrayList<>());
         B.pop();

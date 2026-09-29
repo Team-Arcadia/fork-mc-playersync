@@ -312,12 +312,29 @@ public class ModCompatSync {
             // destination server had, which is what an admin excluding a world-bound key
             // (a saved home, a per-world cooldown) expects.
             CompoundTag incoming = filterPersistentData(stored);
+
+            // Nested entries ("PlayerPersisted.WaystonesData") live inside a key we do
+            // replace, so remember the destination's own values before the swap and put
+            // them back afterwards.
+            java.util.List<String[]> nestedPaths = nestedBlacklistPaths();
+            java.util.Map<String[], net.minecraft.nbt.Tag> localNested = new java.util.HashMap<>();
+            for (String[] path : nestedPaths) {
+                net.minecraft.nbt.Tag local = getAtPath(target, path);
+                localNested.put(path, local == null ? null : local.copy());
+            }
+
             for (String key : new java.util.ArrayList<>(target.getAllKeys())) {
                 if (isPersistentKeyBlacklisted(key)) continue;
                 target.remove(key);
             }
             for (String key : incoming.getAllKeys()) {
                 target.put(key, incoming.get(key).copy());
+            }
+
+            for (String[] path : nestedPaths) {
+                removeAtPath(target, path);
+                net.minecraft.nbt.Tag local = localNested.get(path);
+                if (local != null) putAtPath(target, path, local);
             }
             PlayerSync.LOGGER.debug("Applied persistent data for player {} ({} keys)",
                     player.getUUID(), incoming.getAllKeys().size());
@@ -333,6 +350,9 @@ public class ModCompatSync {
             net.minecraft.nbt.Tag value = source.get(key);
             if (value != null) out.put(key, value.copy());
         }
+        for (String[] path : nestedBlacklistPaths()) {
+            removeAtPath(out, path);
+        }
         return out;
     }
 
@@ -347,5 +367,58 @@ public class ModCompatSync {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /**
+     * Blacklist entries containing a dot name a key nested inside compounds, e.g.
+     * {@code "PlayerPersisted.WaystonesData"}. Balm mods (Waystones, NetherPortalFix)
+     * all share the top-level {@code PlayerPersisted} compound with data that must keep
+     * syncing (Corail Tombstone), so only their own sub-key can be excluded.
+     */
+    private static java.util.List<String[]> nestedBlacklistPaths() {
+        java.util.List<String[]> paths = new java.util.ArrayList<>();
+        try {
+            java.util.List<?> blacklist = JdbcConfig.PERSISTENT_DATA_BLACKLIST.get();
+            if (blacklist == null) return paths;
+            for (Object entry : blacklist) {
+                if (entry == null) continue;
+                String s = entry.toString();
+                if (s.indexOf('.') <= 0 || s.endsWith(".")) continue;
+                paths.add(s.split("\\."));
+            }
+        } catch (Throwable ignored) {
+        }
+        return paths;
+    }
+
+    private static CompoundTag getParent(CompoundTag root, String[] path, boolean create) {
+        CompoundTag current = root;
+        for (int i = 0; i < path.length - 1; i++) {
+            if (current.contains(path[i], net.minecraft.nbt.Tag.TAG_COMPOUND)) {
+                current = current.getCompound(path[i]);
+            } else if (create && !current.contains(path[i])) {
+                CompoundTag child = new CompoundTag();
+                current.put(path[i], child);
+                current = child;
+            } else {
+                return null;
+            }
+        }
+        return current;
+    }
+
+    private static net.minecraft.nbt.Tag getAtPath(CompoundTag root, String[] path) {
+        CompoundTag parent = getParent(root, path, false);
+        return parent == null ? null : parent.get(path[path.length - 1]);
+    }
+
+    private static void removeAtPath(CompoundTag root, String[] path) {
+        CompoundTag parent = getParent(root, path, false);
+        if (parent != null) parent.remove(path[path.length - 1]);
+    }
+
+    private static void putAtPath(CompoundTag root, String[] path, net.minecraft.nbt.Tag value) {
+        CompoundTag parent = getParent(root, path, true);
+        if (parent != null) parent.put(path[path.length - 1], value);
     }
 }
