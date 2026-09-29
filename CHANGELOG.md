@@ -4,6 +4,18 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
+## [2.1.8] - 2026-09-29 (Per-world keys inside shared persistent data)
+
+### Fixed (English first)
+
+- **Known waystones wiped after playing on another server (Arcadia #285)** - Waystones stores a player's known waystones under `PlayerPersisted -> WaystonesData`, through Balm. `sync_persistent_data` mirrored the whole `PlayerPersisted` compound, so the destination server pruned waystones that do not exist in its world and the pruned list overwrote the origin server's list on the next join. `persistent_data_blacklist` now accepts dotted entries naming a nested key (`"PlayerPersisted.WaystonesData"`): the key is left out of the stored data and each server keeps its own value on join, while the other keys of the same compound (Corail Tombstone's `tb_player_tag`) keep syncing. Top-level entries behave as before.
+
+### Corrigé (français)
+
+- **Waystones connues effacées après un passage sur un autre serveur (Arcadia #285)** - Waystones range les waystones connues d'un joueur sous `PlayerPersisted -> WaystonesData`, via Balm. `sync_persistent_data` recopiait tout le bloc `PlayerPersisted` : le serveur d'arrivée supprimait les waystones absentes de son monde, et la liste réduite écrasait celle du serveur d'origine au join suivant. `persistent_data_blacklist` accepte désormais des entrées pointées qui désignent une clé imbriquée (`"PlayerPersisted.WaystonesData"`) : la clé n'est plus stockée et chaque serveur garde sa propre valeur au join, tandis que les autres clés du même bloc (le `tb_player_tag` de Corail Tombstone) continuent de se synchroniser. Les entrées de premier niveau fonctionnent comme avant.
+
+---
+
 ## [2.1.7] - 2026-09-21 (Sophisticated Backpacks API compatibility)
 
 ### Fixed (English first)

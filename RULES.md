@@ -9,7 +9,7 @@ Single source of truth for anyone (human or tooling) working on this repository.
 | Project      | PlayerSync (Team Arcadia fork)                                     |
 | Mod ID       | `playersync`                                                       |
 | Package      | `vip.fubuki.playersync`                                            |
-| Version      | 2.1.7 (VERSION LOCKED — see §3)                                    |
+| Version      | 2.1.8 (VERSION LOCKED — see §3)                                    |
 | Tech stack   | Java 21, NeoForge 21.1.x (Minecraft 1.21.1), Gradle (ModDevGradle) |
 | Storage      | MySQL / MariaDB via HikariCP                                       |
 | Authors      | mlus (upstream), Team Arcadia / vyrriox (fork maintenance)         |
