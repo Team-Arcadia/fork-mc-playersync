@@ -18,9 +18,10 @@ Single source of truth for anyone (human or tooling) working on this repository.
 
 ## 2. Git Workflow
 
-- Active branches: `Arcadia-Fix` (default, production fixes) and `Arcadia-Dev` (experiments). PRs target `main` upstream only when explicitly requested.
+- Single branch: `Arcadia-Fix` (default). All work is committed and pushed there; no other branch is kept on the repository. PRs target the upstream repository only when explicitly requested.
 - Commit style: `type: short message` (`fix:`, `perf:`, `docs:`, `chore:`, `audit:`). Iterative bugfix campaigns are suffixed `rN` (see git log: `fix: revive-dup r7 — ...`).
 - Push directly to `Arcadia-Fix` after build passes. No force-push.
+- Pushing ANY tag triggers `build.yml`, which publishes to Modrinth: tag a release only when it is meant to be published.
 - NEVER commit: `test-procedures/`, `TEST_PROCEDURE_*.html`, `.claude/`, `CLAUDE.md`, `run/`, `build/`.
 
 ## 3. Code Conventions
