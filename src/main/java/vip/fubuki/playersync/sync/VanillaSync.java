@@ -33,7 +33,6 @@ import net.minecraft.world.level.storage.WorldData;
 import net.neoforged.bus.api.SubscribeEvent;
 import net.neoforged.fml.ModList;
 import net.neoforged.fml.common.EventBusSubscriber;
-import net.neoforged.neoforge.event.OnDatapackSyncEvent;
 import net.neoforged.neoforge.event.entity.living.LivingDeathEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerEvent;
 import net.neoforged.neoforge.event.entity.player.PlayerNegotiationEvent;
@@ -96,6 +95,24 @@ public class VanillaSync {
 
     static {
         ((ThreadPoolExecutor) executorService).allowCoreThreadTimeOut(true);
+    }
+
+    /**
+     * 2.2.0: join tasks get their own threads. A join spends most of its life waiting: on
+     * the previous session's logout save (up to 15 s) and on the peer server's poll (up to a
+     * minute). Sharing the save pool meant a wave of server transfers could put all 16 save
+     * workers to sleep, and the logout saves those joins were waiting for then sat in the
+     * queue behind them until the 15 s wait gave up and the join read stale data. Nothing
+     * here ever runs on the main thread, so the queue is unbounded: joins are bounded by
+     * the number of players connecting.
+     */
+    private static final ThreadPoolExecutor joinExecutor = new ThreadPoolExecutor(
+            16, 16, 30L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(),
+            new PSThreadPoolFactory("PlayerSync-join"));
+
+    static {
+        joinExecutor.allowCoreThreadTimeOut(true);
     }
 
     /**
@@ -183,7 +200,7 @@ public class VanillaSync {
         // long-running hub servers. Cost of eviction: one disk re-read on the
         // player's next-session first snapshot (mtime check guarantees freshness).
         advancementsFileCache.keySet().removeIf(k -> k.contains(uuid));
-        lastAppliedAdvancementsHash.remove(uuid);
+        lastWrittenAdvancements.remove(uuid);
         // 2.1.6: release the container-storage handles established for this session
         // (see StorageOwnership) together with their write-skip hashes. Keeping them
         // would both leak memory on a hub server and let a stale hash suppress a write
@@ -302,138 +319,60 @@ public class VanillaSync {
     }
 
     /**
-     * Checks if a player is still in the server's online player list.
-     * Used to avoid applying sync data to a player entity that already disconnected.
-     * <p>PERF (A5): O(1) lookup via PlayerList's internal UUID→player map instead of
-     * the previous O(n) iteration with a per-player {@code UUID#toString} allocation.
+     * Writes the stored advancements to the player's file and reloads them. MAIN THREAD:
+     * snapshotPlayerData reads the same file on the main thread and reload() mutates
+     * PlayerAdvancements.
+     *
+     * <p>2.2.0: called from the join restore, after the claim (see doPlayerJoin), instead of
+     * from OnDatapackSyncEvent at login. Also skips the write and the reload (5-50 ms on a
+     * large datapack) when the stored blob is byte-identical to the local file, the usual
+     * case when a player rejoins the server they just left.
      */
-    private static boolean isPlayerOnline(MinecraftServer server, String uuid) {
-        try {
-            return server.getPlayerList().getPlayer(UUID.fromString(uuid)) != null;
-        } catch (IllegalArgumentException ignored) {
-            return false;
-        }
-    }
-
-    @SubscribeEvent
-    public static void onDataPackSyncEvent(OnDatapackSyncEvent event) {
-        if (!JdbcConfig.SYNC_ADVANCEMENTS.get())
-            return; // advancement sync disabled
-
-        final ServerPlayer serverPlayer = event.getPlayer();
-        if (serverPlayer == null) {
-            PlayerSync.LOGGER.debug("No player joining");
+    private static void applyAdvancementsFromData(MinecraftServer server, ServerPlayer serverPlayer,
+                                                  String player_uuid, String advancementsData) {
+        if (!JdbcConfig.SYNC_ADVANCEMENTS.get()) return;
+        if (advancementsData == null || advancementsData.length() < 2) {
+            PlayerSync.LOGGER.debug("Skip writing advancements for player {} (empty data)", player_uuid);
             return;
         }
+        try {
+            final byte[] bytes = advancementsData.getBytes(StandardCharsets.UTF_8);
+            Path path = server.getServerDirectory().resolve(getSyncWorldForServer());
+            File gameDir = path.toFile();
 
-        final String player_uuid = serverPlayer.getUUID().toString();
-        PlayerSync.LOGGER.info("Player entity joining level {}", player_uuid);
+            if (server.isDedicatedServer()) {
+                File advancements = new File(gameDir, "/advancements" + "/" + player_uuid + ".json");
+                if (advancements.isFile() && java.util.Arrays.equals(Files.readAllBytes(advancements.toPath()), bytes)) {
+                    PlayerSync.LOGGER.debug("Advancements of {} already match the stored copy — no reload", player_uuid);
+                    return;
+                }
 
-        // AUDIT FIX (main-thread I/O): the advancements SELECT used to run
-        // synchronously inside this MAIN-THREAD event handler — one blocking MySQL
-        // round-trip per join (worst case 10s connectionTimeout). The SELECT now
-        // runs on the executor; ONLY the file write + reload() hop back to the main
-        // thread (they must stay there: snapshotPlayerData reads the same file on
-        // the main thread, and reload() mutates PlayerAdvancements).
-        executorService.submit(() -> {
-            try {
-                String advancementsData;
-                try (JDBCsetUp.QueryResult advancementsQuery = JDBCsetUp.executePreparedQuery(
-                        "SELECT advancements FROM " + Tables.playerData() + " WHERE uuid=?", player_uuid)) {
-                    ResultSet advancementsResultSet = advancementsQuery.resultSet();
-                    if (!advancementsResultSet.next()) {
-                        PlayerSync.LOGGER.debug("No advancements found for player {}", player_uuid);
+                File advancementsDir = advancements.getParentFile();
+                if (advancementsDir != null && !advancementsDir.exists()) {
+                    PlayerSync.LOGGER.info("Creating advancements directory {}", advancementsDir.getPath());
+                    if (!advancementsDir.mkdirs()) {
+                        PlayerSync.LOGGER.error("Aborting advancements sync. Failed to create advancements directory at {}", advancementsDir.getPath());
                         return;
                     }
-                    advancementsData = advancementsResultSet.getString("advancements");
                 }
+                PlayerSync.LOGGER.debug("Writing advancement file {} for player {}", advancements.toPath(), player_uuid);
+                Files.write(advancements.toPath(), bytes);
 
-                if (advancementsData == null || advancementsData.length() < 2) {
-                    PlayerSync.LOGGER.debug("Skip writing advancements for player {} (empty data)", player_uuid);
-                    return;
+                // reload the JSON files on the server after updating them
+                PlayerAdvancements playeradvancements = serverPlayer.getAdvancements();
+                playeradvancements.reload(server.getAdvancements());
+            } else {
+                PlayerSync.LOGGER.debug("Writing non-dedicated server advancement files");
+                File[] files = scanAdvancementsFile(player_uuid, gameDir);
+                for (File file : files) {
+                    if (file == null)
+                        continue;
+                    Files.write(file.toPath(), bytes);
                 }
-
-                final byte[] bytes = advancementsData.getBytes(StandardCharsets.UTF_8);
-
-                // PERF (A3): skip the file write + playeradvancements.reload() if the DB content
-                // is identical to what we last applied for this player. reload() walks every
-                // criterion of every advancement and can take 5-50 ms on a large datapack.
-                // CRC32 is enough — collisions on advancement JSON are astronomically unlikely
-                // and a stale skip just means the player sees their progression with the same
-                // (already-applied) data, never with corruption.
-                java.util.zip.CRC32 crc = new java.util.zip.CRC32();
-                crc.update(bytes);
-                final long contentHash = crc.getValue();
-                Long lastHash = lastAppliedAdvancementsHash.get(player_uuid);
-                if (lastHash != null && lastHash == contentHash) {
-                    PlayerSync.LOGGER.debug("Skip advancements re-apply for {} (CRC32 unchanged: {})", player_uuid, contentHash);
-                    return;
-                }
-
-                final MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-                if (server == null) return;
-
-                // MAIN THREAD: file write + reload (entity + main-thread-read file access).
-                server.execute(() -> {
-                    try {
-                        if (!isPlayerOnline(server, player_uuid)) {
-                            PlayerSync.LOGGER.debug("Player {} left before advancements apply", player_uuid);
-                            return;
-                        }
-                        Path path = server.getServerDirectory().resolve(getSyncWorldForServer());
-                        File gameDir = path.toFile();
-
-                        if (server.isDedicatedServer()) {
-                            PlayerSync.LOGGER.debug("Attempting to write dedicated server advancement file");
-                            File advancements = new File(gameDir,
-                                    "/advancements" + "/" + player_uuid + ".json");
-
-                            File advancementsDir = advancements.getParentFile();
-                            if (advancementsDir != null && !advancementsDir.exists()) {
-                                PlayerSync.LOGGER.info("Creating advancements directory {}", advancementsDir.getPath());
-                                boolean createdDir = advancementsDir.mkdirs();
-                                if (!createdDir) {
-                                    PlayerSync.LOGGER.error("Aborting advancements sync. Failed to create advancements directory at {}", advancementsDir.getPath());
-                                    return;
-                                }
-                            }
-
-                            if (!advancements.exists()) {
-                                try {
-                                    PlayerSync.LOGGER.info("Creating new advancement file for player {}", player_uuid);
-                                    advancements.createNewFile();
-                                } catch (IOException e) {
-                                    PlayerSync.LOGGER.error("Aborting advancements sync. Failed to create advancements file at {}", advancements.getAbsolutePath(), e);
-                                    return;
-                                }
-                            }
-                            PlayerSync.LOGGER.debug("Writing advancement file {} for player {}", advancements.toPath(), player_uuid);
-                            Files.write(advancements.toPath(), bytes);
-
-                            // reload the JSON files on the server after updating them
-                            PlayerAdvancements playeradvancements = serverPlayer.getAdvancements();
-                            playeradvancements.reload(server.getAdvancements());
-
-                        } else {
-                            PlayerSync.LOGGER.debug("Writing non-dedicated server advancement files");
-                            File[] files = scanAdvancementsFile(player_uuid, gameDir);
-                            for (File file : files) {
-                                if (file == null)
-                                    continue;
-                                Files.write(file.toPath(), bytes);
-                            }
-                        }
-                        // PERF (A3): record the hash of what we just applied. Next call with the
-                        // same DB content short-circuits before touching the disk and reload().
-                        lastAppliedAdvancementsHash.put(player_uuid, contentHash);
-                    } catch (Exception e) {
-                        PlayerSync.LOGGER.error("Error applying advancements for player {}", player_uuid, e);
-                    }
-                });
-            } catch (Exception e) {
-                PlayerSync.LOGGER.error("Error reading advancements for player {}", player_uuid, e);
             }
-        });
+        } catch (Exception e) {
+            PlayerSync.LOGGER.error("Error applying advancements for player {}", player_uuid, e);
+        }
     }
 
     public static void doPlayerConnect(PlayerNegotiationEvent event) {
@@ -490,6 +429,166 @@ public class VanillaSync {
     // Use string uuid as key
     public static Set<String> deadPlayerWhileLogging = ConcurrentHashMap.newKeySet();
     public static Set<String> syncNotCompletedPlayer = ConcurrentHashMap.newKeySet();
+
+    /**
+     * 2.2.0: identity of the login a background join task is working for. A fresh token is
+     * installed on the main thread when PlayerLoggedInEvent fires and removed when that
+     * player logs out. The join task polls for minutes in the worst case, so it must be able
+     * to tell "my player is still here" from "my player left" or "my player left and came
+     * back as a new session": the uuid alone cannot, and acting for a departed session is
+     * how a claim used to be left behind (online=1 on a server the player had already left).
+     */
+    private static final ConcurrentHashMap<String, Object> joinSessions = new ConcurrentHashMap<>();
+
+    private static boolean isJoinSessionCurrent(String uuid, Object token) {
+        return token != null && joinSessions.get(uuid) == token;
+    }
+
+    /**
+     * Ends the "sync pending" state of a join, but only for the session that started it. A
+     * departed session's logout already cleared the flag, and a newer session owns its own
+     * entry: clearing it from an old task would let the new session save before its restore.
+     */
+    private static void finishJoin(String uuid, Object token) {
+        if (isJoinSessionCurrent(uuid, token)) syncNotCompletedPlayer.remove(uuid);
+    }
+
+    /**
+     * Kicks the joining player when their row says they are online on another server whose
+     * heartbeat is fresh — the {@code kick_when_already_online} rule, with the same decision
+     * the main-thread check used to take. A peer whose heartbeat is stale is marked disabled
+     * instead. Runs on the join thread; the kick itself hops to the main thread.
+     *
+     * @return true when the player is being kicked and the join must stop here
+     */
+    private static boolean checkAlreadyOnlineElsewhere(MinecraftServer server, ServerPlayer serverPlayer,
+                                                       String player_uuid, Object session) {
+        try {
+            int lastServer = onlineElsewhere(player_uuid);
+            if (lastServer == 0) return false;
+            // 2.2.0: kick_grace_period_ms was documented ("lets the legitimate session
+            // re-establish") but never read. A player switching servers usually arrives
+            // while the previous server is still committing their logout: give it the grace
+            // period, then look again before calling it a duplicate login.
+            int graceMs = JdbcConfig.KICK_GRACE_PERIOD_MS.get();
+            if (graceMs > 0) {
+                Thread.sleep(graceMs);
+                if (!isJoinSessionCurrent(player_uuid, session)) return true; // gone; nothing left to do
+                lastServer = onlineElsewhere(player_uuid);
+                if (lastServer == 0) return false;
+            }
+            boolean peerAlive = false;
+            boolean peerKnown = false;
+            try (JDBCsetUp.QueryResult qr2 = JDBCsetUp.executePreparedQuery(
+                    "SELECT last_update, enable FROM " + Tables.serverInfo() + " WHERE id=?", lastServer)) {
+                ResultSet rs2 = qr2.resultSet();
+                if (rs2.next()) {
+                    peerKnown = true;
+                    peerAlive = rs2.getBoolean("enable") && System.currentTimeMillis() < rs2.getLong("last_update") + 300000L;
+                }
+            }
+            if (!peerAlive) {
+                if (peerKnown) {
+                    JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET enable=0 WHERE id=?", lastServer);
+                }
+                return false;
+            }
+            final int peer = lastServer;
+            server.execute(() -> {
+                if (!isJoinSessionCurrent(player_uuid, session)) return;
+                kickedForDuplicateLogin.add(player_uuid);
+                PlayerSync.LOGGER.warn("Kicking player {} - already online on server {}", player_uuid, peer);
+                serverPlayer.connection.disconnect(Component.translatableWithFallback(
+                        "playersync.already_online",
+                        "You can't join more than one synchronization server at the same time."));
+            });
+            return true;
+        } catch (Exception e) {
+            // Same as before: a failed check does not block the login. The claim protocol
+            // below still refuses to take a row another server holds.
+            PlayerSync.LOGGER.error("Error during kick check for player {}", player_uuid, e);
+            return false;
+        }
+    }
+
+    /**
+     * @return the id of the other server the row says the player is online on, or 0 when
+     *         the row is free, ours, or that server is visibly finishing the player's logout
+     *         save (a server switch in progress, which the join poll waits for — not a
+     *         duplicate login)
+     */
+    private static int onlineElsewhere(String player_uuid) throws SQLException {
+        try (JDBCsetUp.QueryResult qr = JDBCsetUp.executePreparedQuery(
+                "SELECT online, last_server, COALESCE(logout_started_at, 0) AS lsa FROM " + Tables.playerData()
+                        + " WHERE uuid=?", player_uuid)) {
+            ResultSet rs = qr.resultSet();
+            if (!rs.next()) return 0;
+            if (!rs.getBoolean("online") || rs.getLong("lsa") > 0) return 0;
+            int lastServer = rs.getInt("last_server");
+            return lastServer == JdbcConfig.SERVER_ID.get() ? 0 : lastServer;
+        }
+    }
+
+    /**
+     * Clears the online flag of a player who leaves without a data save, on the executor.
+     *
+     * <p>2.2.0: guarded by {@code last_server}. The unguarded version also ran for players
+     * whose join never claimed the row (they left while waiting for the previous server),
+     * and so cleared a flag that belonged to another server: that server's auto-saves then
+     * saw "offline" and skipped the player for the rest of the session.
+     */
+    private static void markOfflineIfOwned(String uuid, String what) {
+        executorService.execute(() -> {
+            try {
+                releaseOwnFlag(uuid, false);
+            } catch (SQLException e) {
+                PlayerSync.LOGGER.error("Error marking {} offline: {}", what, uuid, e);
+            }
+        });
+    }
+
+    /**
+     * Gives back a claim taken for a session that no longer exists. Only touches the row
+     * while it is still ours, so it can never clear a flag another server set meanwhile.
+     */
+    private static void releaseOrphanedClaim(String uuid) {
+        try {
+            if (releaseOwnFlag(uuid, true)) {
+                SyncLogger.raceCondition(uuid, "Player left during join — claim released");
+            }
+        } catch (Exception e) {
+            PlayerSync.LOGGER.warn("Could not release the claim of departed player {}: {}", uuid, e.getMessage());
+        }
+    }
+
+    /**
+     * Sets {@code online=0} on a row this server owns, for a session that has ended.
+     *
+     * <p>The row cannot say WHICH session of this server holds it. If the player has already
+     * logged in here again, the newer session owns the flag and it must stay set: clearing it
+     * would let a peer claim the player mid-session and make every periodic save of the new
+     * session miss its {@code online=1} guard. Hence the check before the write, and the
+     * re-assert after it for a newer login that started in between (guarded by
+     * {@code last_server}, so a peer that claimed in that instant keeps its claim).
+     *
+     * @return true when a row was released
+     */
+    private static boolean releaseOwnFlag(String uuid, boolean clearLogoutMarker) throws SQLException {
+        if (joinSessions.containsKey(uuid)) return false;
+        int serverId = JdbcConfig.SERVER_ID.get();
+        int n = JDBCsetUp.executePreparedUpdateRet(
+                "UPDATE " + Tables.playerData() + " SET online=0"
+                        + (clearLogoutMarker ? ", logout_started_at=NULL" : "")
+                        + " WHERE uuid=? AND last_server=? AND online=1",
+                uuid, serverId);
+        if (n > 0 && joinSessions.containsKey(uuid)) {
+            JDBCsetUp.executePreparedUpdate(
+                    "UPDATE " + Tables.playerData() + " SET online=1 WHERE uuid=? AND last_server=?",
+                    uuid, serverId);
+            return false;
+        }
+        return n > 0;
+    }
     // Players kicked for being already online on another server - their logout must NOT set online=0
     public static Set<String> kickedForDuplicateLogin = ConcurrentHashMap.newKeySet();
 
@@ -507,21 +606,14 @@ public class VanillaSync {
     private static final long CONNECT_CHECK_TTL_MS = 60_000L; // 60 s — generous: handshake usually completes in < 5 s
     private static long lastConnectCheckSweepTick = 0L;
 
-    // PERF (A3): per-UUID hash of the last advancements payload we wrote to disk.
-    // onDataPackSyncEvent currently always Files.writes + playeradvancements.reload()s
-    // on the main thread; reload() walks every criterion of every advancement which
-    // can be 5-50 ms on a large datapack. Skip both when the DB content hashes to the
-    // same value we last applied for this player.
-    private static final ConcurrentHashMap<String, Long> lastAppliedAdvancementsHash = new ConcurrentHashMap<>();
-
-    public static void doPlayerJoin(PlayerEvent.PlayerLoggedInEvent event) {
+    public static void doPlayerJoin(PlayerEvent.PlayerLoggedInEvent event, Object session) {
         ServerPlayer serverPlayer = (ServerPlayer) event.getEntity();
         String player_uuid = serverPlayer.getUUID().toString();
         MinecraftServer server = serverPlayer.getServer();
 
         if (server == null) {
             PlayerSync.LOGGER.error("Server is null for player {}", player_uuid);
-            syncNotCompletedPlayer.remove(player_uuid);
+            finishJoin(player_uuid, session);
             return;
         }
 
@@ -531,9 +623,13 @@ public class VanillaSync {
         // FIX: ReviveMe compatibility — check if the player is in a "downed" state (not truly dead).
         // ReviveMe cancels LivingDeathEvent and puts players at low health with special effects.
         // These players have health > 0 and should NOT be kicked. Only kick if actually dead (health <= 0).
+        // 2.2.0: a join task that starts late may belong to a session that already ended;
+        // it must not act on that entity (nor flag the uuid for the NEXT session's logout).
+        if (!isJoinSessionCurrent(player_uuid, session)) return;
         if (serverPlayer.isDeadOrDying() && serverPlayer.getHealth() <= 0) {
-            deadPlayerWhileLogging.add(player_uuid);
             server.execute(() -> {
+                if (!isJoinSessionCurrent(player_uuid, session)) return;
+                deadPlayerWhileLogging.add(player_uuid);
                 serverPlayer.removeTag("player_synced");
                 ResourceKey<Level> respawnLevel = serverPlayer.getRespawnDimension();
                 BlockPos respawnPos = serverPlayer.getRespawnPosition();
@@ -550,18 +646,39 @@ public class VanillaSync {
             return;
         }
 
+        // kick_when_already_online, evaluated here on the join thread (see onPlayerLoggedInKickCheck).
+        if (JdbcConfig.KICK_WHEN_ALREADY_ONLINE.get() && checkAlreadyOnlineElsewhere(server, serverPlayer, player_uuid, session)) {
+            return;
+        }
+
         // FIX ANTI-DUPLICATION: Wait for any pending logout save from a previous session
         // on THIS server. Without this, a fast disconnect+reconnect reads stale DB data
         // while the previous session's async save is still in flight.
         CompletableFuture<Void> pendingSave = pendingLogoutSaves.get(player_uuid);
         if (pendingSave != null) {
             PlayerSync.LOGGER.info("Waiting for pending logout save to complete for player {}", player_uuid);
-            try {
-                pendingSave.get(15, TimeUnit.SECONDS);
-            } catch (TimeoutException e) {
-                PlayerSync.LOGGER.error("Timeout waiting for pending logout save for player {}", player_uuid);
-            } catch (Exception e) {
-                PlayerSync.LOGGER.warn("Pending logout save failed for player {}", player_uuid, e);
+            // Same 15 s budget as before, in short steps so a player who leaves in the
+            // meantime frees this join thread instead of holding it for the full wait.
+            final long deadline = System.currentTimeMillis() + 15_000L;
+            while (true) {
+                if (!isJoinSessionCurrent(player_uuid, session)) return;
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) {
+                    PlayerSync.LOGGER.error("Timeout waiting for pending logout save for player {}", player_uuid);
+                    break;
+                }
+                try {
+                    pendingSave.get(Math.min(left, 500L), TimeUnit.MILLISECONDS);
+                    break;
+                } catch (TimeoutException e) {
+                    // keep waiting
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                } catch (Exception e) {
+                    PlayerSync.LOGGER.warn("Pending logout save failed for player {}", player_uuid, e);
+                    break;
+                }
             }
         }
 
@@ -622,8 +739,14 @@ public class VanillaSync {
             final long STALE_HEARTBEAT_MS = JdbcConfig.PEER_STALE_THRESHOLD_SECONDS.get() * 1000L;
             // logout_started_at age beyond which we treat a 'save in progress'
             // as actually stuck (peer crashed mid-save). Saves typically complete
-            // in < 1s, so 10s is 10× safety margin.
-            final long LOGOUT_SAVE_MAX_MS = 10_000L;
+            // in < 1s.
+            // 2.2.0: never below the JDBC socket timeout plus a margin. A peer whose save
+            // is merely slow (struggling database) can legitimately sit on one statement
+            // for up to jdbc_socket_timeout_seconds; claiming at 10 s made its final write
+            // fail the last_server guard and lost the player's last session. The stamp is
+            // also written when the save starts now, not when it was queued.
+            final long LOGOUT_SAVE_MAX_MS = Math.max(10_000L,
+                    JdbcConfig.JDBC_SOCKET_TIMEOUT_SECONDS.get() * 1000L + 10_000L);
             // How long an ALIVE peer holding online=1 without a logout marker is tolerated
             // before we take ownership anyway. The effective ceiling is also bounded by the
             // poll budget (join_poll_max_attempts x join_poll_interval_ms): once that runs
@@ -642,6 +765,15 @@ public class VanillaSync {
             boolean isNewPlayer = false;
             final long pollStartTime = System.currentTimeMillis();
             for (int attempt = 0; attempt < MAX_POLL; attempt++) {
+                // 2.2.0: stop waiting for a player who is gone. Polling on would end in a
+                // claim taken for nobody: the departed session's logout has already run, so
+                // nothing would ever clear online=1 and the player would be refused on every
+                // server ("already online") until this one restarted.
+                if (!isJoinSessionCurrent(player_uuid, session)) {
+                    PlayerSync.LOGGER.info("Player {} left while waiting for the previous server — join abandoned", player_uuid);
+                    SyncLogger.raceCondition(player_uuid, "Player left during join poll — abandoned before claim");
+                    return;
+                }
                 int otherServer;
                 boolean otherOnline;
                 long logoutStartedAt;     // 0 = NULL (no save in progress)
@@ -761,7 +893,14 @@ public class VanillaSync {
                                     "PlayerSync: another server is finalizing your save. Please reconnect in a few seconds."));
                         }
                     });
-                    syncNotCompletedPlayer.remove(player_uuid);
+                    // 2.2.0: the session stays sync-pending (frozen, never saved) until the
+                    // kick lands; its logout cleans up through the unsynced path.
+                    return;
+                }
+                // The player may have left between the last poll and the claim. Their logout
+                // ran before the claim existed, so the claim is ours to give back.
+                if (!isJoinSessionCurrent(player_uuid, session)) {
+                    releaseOrphanedClaim(player_uuid);
                     return;
                 }
             }
@@ -772,15 +911,18 @@ public class VanillaSync {
             // existence check (rs.next()==false means "new player, run init path") and
             // the full data read. Previously two separate SELECTs on the same row
             // produced two MySQL round-trips per join.
-            // AUDIT FIX: `advancements` is deliberately EXCLUDED from the projection —
-            // it is a MEDIUMBLOB (hundreds of KB to several MB on large modpacks) that
-            // this path never consumes; onDataPackSyncEvent fetches it separately.
-            // SELECT * transferred + compressed that dead column on every join.
+            // 2.2.0: `advancements` is read HERE, after the claim, when advancement sync is
+            // on. It used to be fetched by onDataPackSyncEvent the moment the player logged
+            // in — before the previous server had committed its logout save — so a quick
+            // server switch applied the older blob to disk and the next save made that
+            // rollback permanent. It is the same single round trip as before.
+            final boolean syncAdvancements = JdbcConfig.SYNC_ADVANCEMENTS.get();
             final int health, foodLevel, xp, score;
-            final String leftHand, cursors, armorData, inventoryData, enderChestData, effectData;
+            final String leftHand, cursors, armorData, inventoryData, enderChestData, effectData, advancementsData;
 
             try (JDBCsetUp.QueryResult qr2 = JDBCsetUp.executePreparedQuery(
-                    "SELECT health, food_level, xp, score, left_hand, cursors, armor, inventory, enderchest, effects FROM "
+                    "SELECT health, food_level, xp, score, left_hand, cursors, armor, inventory, enderchest, effects"
+                            + (syncAdvancements ? ", advancements" : "") + " FROM "
                             + Tables.playerData() + " WHERE uuid=?", player_uuid)) {
                 ResultSet rs2 = qr2.resultSet();
                 if (!rs2.next()) {
@@ -801,8 +943,8 @@ public class VanillaSync {
                     } else { newPlayerCuriosData = null; }
 
                     server.execute(() -> {
-                        if (!isPlayerOnline(server, player_uuid)) {
-                            syncNotCompletedPlayer.remove(player_uuid);
+                        if (!isJoinSessionCurrent(player_uuid, session)
+                                || server.getPlayerList().getPlayer(serverPlayer.getUUID()) != serverPlayer) {
                             return;
                         }
                         try {
@@ -840,20 +982,35 @@ public class VanillaSync {
                                                 s.uuid(), s.curiosData());
                                     }
                                     ModsSupport.saveBackpackSnapshots(storageSnapshots);
+                                    // The INSERT writes online=1. If the player left while it
+                                    // was queued, their logout's online=0 may already have run
+                                    // against a row that did not exist yet: give the flag back.
+                                    if (!isJoinSessionCurrent(player_uuid, session)) {
+                                        releaseOrphanedClaim(player_uuid);
+                                        return;
+                                    }
+                                    // Tag first, then lift the pending flag, both on the main
+                                    // thread: a logout can never see the session as finished
+                                    // but not yet tagged.
                                     server.execute(() -> {
-                                        if (isPlayerOnline(server, player_uuid)) {
+                                        if (isJoinSessionCurrent(player_uuid, session)) {
                                             serverPlayer.addTag("player_synced");
                                         }
+                                        finishJoin(player_uuid, session);
                                     });
                                 } catch (Exception e) {
                                     PlayerSync.LOGGER.error("Error persisting new player {}", player_uuid, e);
-                                } finally {
-                                    syncNotCompletedPlayer.remove(player_uuid);
+                                    // 2.2.0: without a row and the tag nothing of this session
+                                    // could ever be saved; ask for a reconnect instead.
+                                    if (isJoinSessionCurrent(player_uuid, session)) {
+                                        server.execute(() -> abortUnsyncedSession(serverPlayer, player_uuid,
+                                                "could not create the player row"));
+                                    }
                                 }
                             });
                         } catch (Exception e) {
                             PlayerSync.LOGGER.error("Error initializing new player {}", player_uuid, e);
-                            syncNotCompletedPlayer.remove(player_uuid);
+                            finishJoin(player_uuid, session);
                         }
                     });
                     return;
@@ -868,6 +1025,7 @@ public class VanillaSync {
                 inventoryData = rs2.getString("inventory");
                 enderChestData = rs2.getString("enderchest");
                 effectData = rs2.getString("effects");
+                advancementsData = syncAdvancements ? rs2.getString("advancements") : null;
             }
 
             // Pre-read ALL mod data on BACKGROUND THREAD (no entity access).
@@ -912,13 +1070,22 @@ public class VanillaSync {
             // per player). This is acceptable because players join one at a time, not 35 at once.
             // The real performance fix is staggering the auto-save (see onServerTick).
             server.execute(() -> {
+                // 2.2.0: the sync-pending flag is only lifted once the restore really
+                // happened. A restore that throws half-way used to lift it anyway, leaving
+                // the player with a partially restored inventory that the next save wrote
+                // over the database. Now the session stays unsynced (nothing it holds is
+                // ever written) and the player is asked to reconnect for a clean retry.
+                boolean completed = false;
                 try {
                     // FIX: Verify the player is still connected before applying data.
-                    // If the player disconnected quickly, the entity is stale and modifying
-                    // it could interfere with the logout save or corrupt state.
-                    if (!isPlayerOnline(server, player_uuid)) {
+                    // 2.2.0: compare the session and the entity itself, not just the uuid —
+                    // after a quick leave + rejoin the uuid is online again, but as a new
+                    // entity that this task must not touch.
+                    if (!isJoinSessionCurrent(player_uuid, session)
+                            || server.getPlayerList().getPlayer(serverPlayer.getUUID()) != serverPlayer) {
                         PlayerSync.LOGGER.warn("Player {} disconnected before sync apply, skipping", player_uuid);
                         SyncLogger.dataLoss(player_uuid, "Player disconnected before sync apply — .dat data may persist, DB data not applied");
+                        completed = true; // nothing to retry: the session is gone
                         return;
                     }
 
@@ -948,57 +1115,100 @@ public class VanillaSync {
                                 player_uuid, joinFallen, joinDead);
                         SyncLogger.playerEvent(player_uuid, "JOIN_FALLEN_SKIP",
                                 "Joined in ReviveMe fallen/dead state — DB apply skipped, vanilla .dat kept (corpse dup prevention)");
+                        // Advancements are progression, not items: they apply either way.
+                        applyAdvancementsFromData(server, serverPlayer, player_uuid, advancementsData);
                         serverPlayer.addTag("player_synced");
+                        completed = true;
                         return; // syncNotCompletedPlayer cleanup runs in the finally block
                     }
 
+                    // 2.2.0: the [sync_toggles] for vanilla data are honoured on both sides.
+                    // A category that is off here is neither restored (the local .dat value
+                    // stays) nor written (the stored value is kept for the servers that do
+                    // sync it). Every toggle defaults to true, which is the historical path.
+                    final boolean syncInventory = JdbcConfig.SYNC_INVENTORY.get();
+                    final boolean syncEnderChest = JdbcConfig.SYNC_ENDER_CHEST.get();
+
                     // ANTI-DUPLICATION: Clear all inventories BEFORE restoring
-                    serverPlayer.getInventory().clearContent();
-                    serverPlayer.getEnderChestInventory().clearContent();
-                    serverPlayer.setItemInHand(InteractionHand.OFF_HAND, ItemStack.EMPTY);
-                    serverPlayer.containerMenu.setCarried(ItemStack.EMPTY);
-                    for (int i = 0; i < serverPlayer.getInventory().armor.size(); i++) {
-                        serverPlayer.getInventory().armor.set(i, ItemStack.EMPTY);
+                    if (syncInventory) {
+                        serverPlayer.getInventory().clearContent();
+                        serverPlayer.setItemInHand(InteractionHand.OFF_HAND, ItemStack.EMPTY);
+                        serverPlayer.containerMenu.setCarried(ItemStack.EMPTY);
+                        // The 2x2 crafting grid is not part of the Inventory: items parked there
+                        // from the stale .dat state would survive the restore and come back to
+                        // the inventory when the grid closes.
+                        for (int i = net.minecraft.world.inventory.InventoryMenu.CRAFT_SLOT_START;
+                             i < net.minecraft.world.inventory.InventoryMenu.CRAFT_SLOT_END; i++) {
+                            serverPlayer.inventoryMenu.getSlot(i).set(ItemStack.EMPTY);
+                        }
+                        for (int i = 0; i < serverPlayer.getInventory().armor.size(); i++) {
+                            serverPlayer.getInventory().armor.set(i, ItemStack.EMPTY);
+                        }
+                    }
+                    if (syncEnderChest) {
+                        serverPlayer.getEnderChestInventory().clearContent();
                     }
 
                     // Restore basic attributes
-                    serverPlayer.setHealth(health <= 0 ? 1 : health);
-                    serverPlayer.getFoodData().setFoodLevel(foodLevel);
-                    setXpForPlayer(serverPlayer, xp);
-                    serverPlayer.setScore(score);
+                    if (JdbcConfig.SYNC_HEALTH_FOOD.get()) {
+                        serverPlayer.setHealth(health <= 0 ? 1 : health);
+                        serverPlayer.getFoodData().setFoodLevel(foodLevel);
+                    }
+                    if (JdbcConfig.SYNC_XP.get()) {
+                        setXpForPlayer(serverPlayer, xp);
+                        serverPlayer.setScore(score);
+                    }
 
-                    // Restore items
-                    serverPlayer.setItemInHand(InteractionHand.OFF_HAND, deserializeAndCreatePlaceholderIfNeeded(leftHand));
-                    serverPlayer.containerMenu.setCarried(deserializeAndCreatePlaceholderIfNeeded(cursors));
+                    // Restore items. Each slot is restored on its own: one unreadable item
+                    // becomes a placeholder that keeps its stored data instead of aborting
+                    // the restore of everything after it.
+                    if (syncInventory) {
+                        serverPlayer.setItemInHand(InteractionHand.OFF_HAND, restoreItemSafely(leftHand, player_uuid, "offhand"));
+                        serverPlayer.containerMenu.setCarried(restoreItemSafely(cursors, player_uuid, "cursor"));
 
-                    if (armorData != null && armorData.length() > 2) {
-                        Map<Integer, String> equipment = LocalJsonUtil.StringToEntryMap(armorData);
-                        for (Map.Entry<Integer, String> entry : equipment.entrySet()) {
-                            serverPlayer.getInventory().armor.set(entry.getKey(), deserializeAndCreatePlaceholderIfNeeded(entry.getValue()));
+                        if (armorData != null && armorData.length() > 2) {
+                            Map<Integer, String> equipment = LocalJsonUtil.StringToEntryMap(armorData);
+                            for (Map.Entry<Integer, String> entry : equipment.entrySet()) {
+                                if (!validSlot(entry.getKey(), serverPlayer.getInventory().armor.size(), player_uuid, "armor")) continue;
+                                serverPlayer.getInventory().armor.set(entry.getKey(),
+                                        restoreItemSafely(entry.getValue(), player_uuid, "armor:" + entry.getKey()));
+                            }
+                        }
+                        if (inventoryData != null && inventoryData.length() > 2) {
+                            Map<Integer, String> inventory = LocalJsonUtil.StringToEntryMap(inventoryData);
+                            for (Map.Entry<Integer, String> entry : inventory.entrySet()) {
+                                if (!validSlot(entry.getKey(), serverPlayer.getInventory().items.size(), player_uuid, "inventory")) continue;
+                                serverPlayer.getInventory().setItem(entry.getKey(),
+                                        restoreItemSafely(entry.getValue(), player_uuid, "inventory:" + entry.getKey()));
+                            }
                         }
                     }
-                    if (inventoryData != null && inventoryData.length() > 2) {
-                        Map<Integer, String> inventory = LocalJsonUtil.StringToEntryMap(inventoryData);
-                        for (Map.Entry<Integer, String> entry : inventory.entrySet()) {
-                            serverPlayer.getInventory().setItem(entry.getKey(), deserializeAndCreatePlaceholderIfNeeded(entry.getValue()));
-                        }
-                    }
-                    if (enderChestData != null && enderChestData.length() > 2) {
+                    if (syncEnderChest && enderChestData != null && enderChestData.length() > 2) {
                         Map<Integer, String> ender_chest = LocalJsonUtil.StringToEntryMap(enderChestData);
                         for (Map.Entry<Integer, String> entry : ender_chest.entrySet()) {
-                            serverPlayer.getEnderChestInventory().setItem(entry.getKey(), deserializeAndCreatePlaceholderIfNeeded(entry.getValue()));
+                            if (!validSlot(entry.getKey(), serverPlayer.getEnderChestInventory().getContainerSize(), player_uuid, "enderchest")) continue;
+                            serverPlayer.getEnderChestInventory().setItem(entry.getKey(),
+                                    restoreItemSafely(entry.getValue(), player_uuid, "enderchest:" + entry.getKey()));
                         }
                     }
 
                     // Always clear effects, then restore from DB
-                    serverPlayer.removeAllEffects();
-                    if (effectData != null && effectData.length() > 2) {
-                        Map<Integer, String> effects = LocalJsonUtil.StringToEntryMap(effectData);
-                        for (Map.Entry<Integer, String> entry : effects.entrySet()) {
-                            CompoundTag effectTag = NbtUtils.snbtToStructure(deserializeString(entry.getValue()));
-                            MobEffectInstance mobEffectInstance = MobEffectInstance.load(effectTag);
-                            if (mobEffectInstance != null) {
-                                serverPlayer.addEffect(mobEffectInstance);
+                    if (JdbcConfig.SYNC_EFFECTS.get()) {
+                        serverPlayer.removeAllEffects();
+                        if (effectData != null && effectData.length() > 2) {
+                            Map<Integer, String> effects = LocalJsonUtil.StringToEntryMap(effectData);
+                            for (Map.Entry<Integer, String> entry : effects.entrySet()) {
+                                try {
+                                    CompoundTag effectTag = NbtUtils.snbtToStructure(deserializeString(entry.getValue()));
+                                    MobEffectInstance mobEffectInstance = MobEffectInstance.load(effectTag);
+                                    if (mobEffectInstance != null) {
+                                        serverPlayer.addEffect(mobEffectInstance);
+                                    }
+                                } catch (Exception effectError) {
+                                    // An effect is not worth failing the whole restore for.
+                                    PlayerSync.LOGGER.warn("Skipping an unreadable effect for player {}: {}",
+                                            player_uuid, effectError.toString());
+                                }
                             }
                         }
                     }
@@ -1011,6 +1221,7 @@ public class VanillaSync {
                     // Corail Tombstone knowledge / alignment / perks and every other mod still
                     // using the legacy scratchpad ride along here.
                     ModCompatSync.applyPersistentDataFromData(serverPlayer, persistentData);
+                    applyAdvancementsFromData(server, serverPlayer, player_uuid, advancementsData);
 
                     // PHASE 12 PERF: prefetch ALL storage UUIDs (backpacks + SS + RS2)
                     // in a single batched SELECT, then apply from the in-memory cache
@@ -1048,6 +1259,7 @@ public class VanillaSync {
                     }
 
                     serverPlayer.addTag("player_synced");
+                    completed = true;
                     long totalRestore = System.currentTimeMillis() - restoreT0;
                     PlayerSync.LOGGER.info("Sync data for player {} completed in {}ms", player_uuid, totalRestore);
                     SyncLogger.restoreCompleted(player_uuid, totalRestore);
@@ -1058,16 +1270,73 @@ public class VanillaSync {
                 } catch (Exception e) {
                     PlayerSync.LOGGER.error("Error applying sync data for player {}", player_uuid, e);
                 } finally {
-                    syncNotCompletedPlayer.remove(player_uuid);
+                    if (completed) {
+                        finishJoin(player_uuid, session);
+                    } else {
+                        abortUnsyncedSession(serverPlayer, player_uuid, "restore failed while applying data");
+                    }
                 }
             });
 
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Internal Exception detected!", e);
-            syncNotCompletedPlayer.remove(player_uuid);
-            removePlayerLock(player_uuid); // FIX: prevent playerLocks memory leak on exception
+            // 2.2.0: a failed read (database hiccup) used to lift the sync-pending flag and
+            // let the player play on with the stale local .dat state — which the next save
+            // then wrote over the database. Keep the session unsynced and ask for a retry.
+            if (isJoinSessionCurrent(player_uuid, session)) {
+                server.execute(() -> abortUnsyncedSession(serverPlayer, player_uuid, "could not read stored data"));
+            }
         } finally {
             if (lock.isHeldByCurrentThread()) lock.unlock();
+        }
+    }
+
+    /**
+     * Ends a session whose restore did not complete without ever saving it. The player
+     * stays in {@link #syncNotCompletedPlayer}, so every save path skips them and their
+     * logout only clears the online flag: the database keeps the last good state and the
+     * next login retries the restore from it. Main thread only.
+     */
+    private static void abortUnsyncedSession(ServerPlayer player, String uuid, String reason) {
+        PlayerSync.LOGGER.error("Sync for player {} did not complete ({}). Nothing from this session will be saved;"
+                + " disconnecting so the next login retries from the database.", uuid, reason);
+        SyncLogger.saveSkipped(uuid, "JOIN", "restore incomplete (" + reason + ") — session left unsynced, player disconnected");
+        try {
+            if (player.connection != null && !player.hasDisconnected()) {
+                player.connection.disconnect(Component.translatableWithFallback("playersync.sync_failed",
+                        "PlayerSync could not load your data. Nothing was lost, please reconnect."));
+            }
+        } catch (Exception e) {
+            PlayerSync.LOGGER.error("Could not disconnect unsynced player {}", uuid, e);
+        }
+    }
+
+    /**
+     * A stored slot index outside the container would throw and fail the whole restore on
+     * every login. Logged and skipped instead (the entry stays in the database until the
+     * next save of this player).
+     */
+    private static boolean validSlot(Integer slot, int size, String playerUuid, String container) {
+        if (slot != null && slot >= 0 && slot < size) return true;
+        PlayerSync.LOGGER.error("Stored {} slot {} is out of range (size {}) for player {} — skipped", container, slot, size, playerUuid);
+        SyncLogger.nbtAnomaly(playerUuid, container + " slot " + slot + " out of range");
+        return false;
+    }
+
+    /**
+     * Restores one stored item. Never throws: a slot whose data cannot be read becomes a
+     * placeholder holding the raw stored string, which {@link #getNbtForStorage} writes back
+     * unchanged. The item therefore survives in the database for an admin to look at instead
+     * of being replaced by an empty slot on the next save.
+     */
+    private static ItemStack restoreItemSafely(String serialized, String playerUuid, String slot) {
+        try {
+            return deserializeAndCreatePlaceholderIfNeeded(serialized);
+        } catch (Exception e) {
+            PlayerSync.LOGGER.error("Unreadable item in {} for player {} ({} chars) — kept as a placeholder: {}",
+                    slot, playerUuid, serialized == null ? 0 : serialized.length(), e.toString());
+            SyncLogger.nbtAnomaly(playerUuid, "unreadable item in " + slot + " kept as placeholder");
+            return createPreservingPlaceholder(serialized, "unknown", 0);
         }
     }
 
@@ -1133,37 +1402,12 @@ public class VanillaSync {
             if (cached != null && cached[0] == 1 && cached[1] != JdbcConfig.SERVER_ID.get() && cached[2] == 0) {
                 // Player was online on another server but that server is dead — already handled
                 // by doPlayerConnect (server disabled). No need to re-query.
-            } else if (cached == null) {
-                // No cache (race condition or cache eviction) — fall back to DB query
-                boolean online = false;
-                int lastServer = 0;
-                try (JDBCsetUp.QueryResult qr = JDBCsetUp.executePreparedQuery(
-                        "SELECT online, last_server FROM " + Tables.playerData() + " WHERE uuid=?", player_uuid)) {
-                    ResultSet rs = qr.resultSet();
-                    if (rs.next()) {
-                        online = rs.getBoolean("online");
-                        lastServer = rs.getInt("last_server");
-                    }
-                }
-                if (online && lastServer != JdbcConfig.SERVER_ID.get()) {
-                    try (JDBCsetUp.QueryResult qr2 = JDBCsetUp.executePreparedQuery(
-                            "SELECT last_update, enable FROM " + Tables.serverInfo() + " WHERE id=?", lastServer)) {
-                        ResultSet rs2 = qr2.resultSet();
-                        if (rs2.next()) {
-                            long lastUpdate = rs2.getLong("last_update");
-                            boolean enable = rs2.getBoolean("enable");
-                            if (enable && System.currentTimeMillis() < lastUpdate + 300000L) {
-                                kickedForDuplicateLogin.add(player_uuid);
-                                player.connection.disconnect(Component.translatableWithFallback(
-                                        "playersync.already_online",
-                                        "You can't join more than one synchronization server at the same time."));
-                                return;
-                            }
-                            JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET enable=0 WHERE id=?", lastServer);
-                        }
-                    }
-                }
             }
+            // 2.2.0: the DB fallback that used to run here (cache miss) is now done by the
+            // join task, off the main thread — see checkAlreadyOnlineElsewhere. On NeoForge
+            // 21.1 PlayerNegotiationEvent is never posted, so the cache above is never filled
+            // and that fallback ran one to three blocking queries on the tick thread for
+            // every single login.
 
             // PHASE 14 FIX: online=1 is no longer written here. See doPlayerJoin's claim
             // UPDATE for the replacement — setting the flag earlier raced the poll and
@@ -1182,14 +1426,29 @@ public class VanillaSync {
         // resources, and leaves stale entries in syncNotCompletedPlayer / playerLocks.
         if (kickedForDuplicateLogin.contains(puuid)) return;
 
+        // 2.2.0: entity tags are saved in the player's .dat, so "player_synced" arrives
+        // already set from the previous session on this server. Strip it so the tag only
+        // ever means "restored from the database in THIS session": the shutdown path and
+        // the auto-save gate on it, and must never persist a .dat state that the restore
+        // has not replaced yet.
+        ((ServerPlayer) event.getEntity()).removeTag("player_synced");
+
         // Mark sync as pending BEFORE submitting to thread pool.
         syncNotCompletedPlayer.add(puuid);
-        executorService.submit(() -> {
+        final Object session = new Object();
+        joinSessions.put(puuid, session);
+        joinExecutor.execute(() -> {
             try {
-                doPlayerJoin(event);
-            } catch (Exception e) {
-                e.printStackTrace();
-                syncNotCompletedPlayer.remove(puuid);
+                doPlayerJoin(event, session);
+            } catch (Throwable e) {
+                // Never restored: nothing from this session may be saved, so do not let the
+                // player play it. Ask for a reconnect instead (see abortUnsyncedSession).
+                PlayerSync.LOGGER.error("Join task failed for player {}", puuid, e);
+                ServerPlayer joining = (ServerPlayer) event.getEntity();
+                MinecraftServer srv = joining.getServer();
+                if (srv != null && isJoinSessionCurrent(puuid, session)) {
+                    srv.execute(() -> abortUnsyncedSession(joining, puuid, "join task failed"));
+                }
             }
         });
     }
@@ -1225,8 +1484,11 @@ public class VanillaSync {
             try {
                 compoundTag = deserializeBinaryBase64Tag(serializedNbt);
             } catch (Exception e) {
-                PlayerSync.LOGGER.error("Failed to deserialize binary NBT data, skipping item.", e);
-                return ItemStack.EMPTY;
+                // 2.2.0: keep the unreadable data instead of dropping it. Returning EMPTY made
+                // the next save write an empty slot, deleting the stored item for good.
+                PlayerSync.LOGGER.error("Failed to deserialize binary NBT data ({} chars), keeping it as a placeholder.",
+                        serializedNbt.length(), e);
+                return createPreservingPlaceholder(serializedNbt, "unknown", 0);
             }
         } else {
             // Legacy SNBT-based deserialization (B64: or old custom format)
@@ -1241,8 +1503,12 @@ public class VanillaSync {
                 try {
                     compoundTag = NbtUtils.snbtToStructure(nbtString);
                 } catch (CommandSyntaxException e2) {
-                    PlayerSync.LOGGER.error("Both SNBT parsers failed ({} chars): {}", nbtString.length(), nbtPreview(nbtString));
-                    throw e; // re-throw original exception
+                    // 2.2.0: keep the data rather than throw. Every caller used to either abort
+                    // its whole restore or leave the slot empty — and an empty slot is what
+                    // the next save writes back, deleting the stored item.
+                    PlayerSync.LOGGER.error("Both SNBT parsers failed ({} chars), keeping it as a placeholder: {}",
+                            nbtString.length(), nbtPreview(nbtString));
+                    return createPreservingPlaceholder(serializedNbt, "unknown", 0);
                 }
             }
         }
@@ -1284,12 +1550,39 @@ public class VanillaSync {
 
         // Create placeholder
         PlayerSync.LOGGER.debug("Item {} not found in registry. Creating placeholder.", registryName);
+        // AUDIT FIX: removed the unconditional WARN that dumped the FULL compound tag
+        // for every placeholder item on every join/restore (log-flood + injection vector).
+        // 1.21 stores the stack size as "count"; "Count" is the pre-1.20.5 spelling.
+        int storedCount = compoundTag.contains("count") ? compoundTag.getInt("count") : compoundTag.getInt("Count");
+        return createPreservingPlaceholder(serializedNbt, registryName.toString(), storedCount);
+    }
+
+    /**
+     * Largest stored item string a placeholder may carry. The placeholder's custom data is
+     * sent to the client with the inventory, so an arbitrarily large payload could exceed
+     * the network limits and kick the player on every login.
+     */
+    private static final int MAX_PRESERVED_ITEM_CHARS = 256 * 1024;
+
+    /**
+     * Builds the paper placeholder that stands in for an item this server cannot rebuild
+     * (mod absent, or stored data unreadable). It carries the original stored string, which
+     * {@link #getNbtForStorage} writes back verbatim, so the real item reappears on a server
+     * that can read it and is never replaced by an empty slot.
+     */
+    private static ItemStack createPreservingPlaceholder(String serializedNbt, String itemId, int count) {
+        if (serializedNbt == null || serializedNbt.isEmpty()) return ItemStack.EMPTY;
+        if (serializedNbt.length() > MAX_PRESERVED_ITEM_CHARS) {
+            PlayerSync.LOGGER.error("Stored item {} is too large to keep as a placeholder ({} chars) — slot left empty",
+                    itemId, serializedNbt.length());
+            return ItemStack.EMPTY;
+        }
         ItemStack placeholder = new ItemStack(Items.PAPER);
 
         CompoundTag placeholderNbt = new CompoundTag();
         // Store the original serialized NBT string, not the parsed CompoundTag string
         placeholderNbt.putString("playersync:original_item_nbt", serializedNbt);
-        placeholderNbt.putString("playersync:original_item_id", registryName.toString());
+        placeholderNbt.putString("playersync:original_item_id", itemId);
 
         // Add a unique UUID to ensure the item is unstackable
         // Stacked placerholders would be converted into a single item when restoring item
@@ -1306,14 +1599,11 @@ public class VanillaSync {
                         .setStyle(Style.EMPTY.withColor(ChatFormatting.RED).withItalic(true)));
 
         List<Component> loreList = new ArrayList<>();
-        String placeholderItemDetails = registryName.toString();
+        String placeholderItemDetails = itemId;
 
         // add a stack size if it is available
-        // AUDIT FIX: removed the unconditional WARN that dumped the FULL compound tag
-        // for every placeholder item on every join/restore (log-flood + injection vector).
-        int placeholderItemAmount = compoundTag.getInt("Count");
-        if (placeholderItemAmount > 1) {
-            placeholderItemDetails = placeholderItemAmount + "x " + placeholderItemDetails;
+        if (count > 1) {
+            placeholderItemDetails = count + "x " + placeholderItemDetails;
         }
 
         loreList.add(
@@ -1458,7 +1748,16 @@ public class VanillaSync {
      */
     @SubscribeEvent
     public static void onPlayerSaveToFile(PlayerEvent.SaveToFile event) {
-        snapshotAndQueueSave(event.getEntity(), "SaveToFile");
+        // 2.2.0: the vanilla autosave fires this for EVERY player in the same tick, so
+        // snapshotting here produced a 35-player snapshot spike every autosave — the exact
+        // spike the staggered queue exists to avoid. The player now joins that queue and is
+        // snapshotted within the next few ticks with the same guard stack. Also fires right
+        // after a logout (PlayerList.remove saves the .dat after the logout event); the
+        // drain finds no online player for that uuid and does nothing.
+        Player player = event.getEntity();
+        MinecraftServer server = player.getServer();
+        if (server == null || !server.isSameThread()) return;
+        enqueueForStaggeredSave(player.getUUID());
     }
 
     /**
@@ -1516,16 +1815,9 @@ public class VanillaSync {
      *               "PERIODIC", "DIMENSION")
      */
     public static void snapshotAndQueueSave(Player player, String label) {
-        // Heartbeat piggyback — cheap, keeps server_info fresh even if no SaveToFile ticks.
-        executorService.submit(() -> {
-            try {
-                JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET last_update=? WHERE id=?",
-                        System.currentTimeMillis(), JdbcConfig.SERVER_ID.get());
-            } catch (SQLException e) {
-                PlayerSync.LOGGER.error("Error updating server heartbeat on {}", label, e);
-            }
-        });
-
+        // 2.2.0: the heartbeat piggyback is gone. HeartbeatService already writes it on its
+        // own thread every heartbeat_interval_seconds; the copy here fired one UPDATE of the
+        // same server_info row per player per save.
         String puuid = player.getUUID().toString();
 
         if (!player.getTags().contains("player_synced")) return;
@@ -1536,68 +1828,159 @@ public class VanillaSync {
         // logout snapshot with a stale one if it runs after the logout save.
         if (pendingLogoutSaves.containsKey(puuid)) return;
 
-        // Use tryLock: if a logout save or another SaveToFile save is already writing
-        // this player's data, skip — the other operation already has fresh data.
-        ReentrantLock lock = getPlayerLock(puuid);
-        if (!lock.tryLock()) return;
-
         try {
             // === MAIN THREAD: FREEZE entity state into ItemStack copies (no serialization yet) ===
             final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
-
             // === BACKGROUND THREAD: serialize + all DB writes — main thread continues immediately ===
-            executorService.submit(() -> {
-                // FIX: If the player already logged out (removePlayerLock was called),
-                // this snapshot is stale and must NOT overwrite the fresher logout snapshot.
-                if (!playerLocks.containsKey(puuid)) return;
-                // FIX CRITICAL ANTI-DUP (P0-a): early skip if logout is already in flight.
-                if (pendingLogoutSaves.containsKey(puuid)) return;
-
-                ReentrantLock bgLock = getPlayerLock(puuid);
-                if (!bgLock.tryLock()) return; // another save started, skip
-                try {
-                    // FIX CRITICAL ANTI-DUP (P0-b): re-check under lock — a logout task may
-                    // have been submitted between the check above and tryLock success.
-                    if (pendingLogoutSaves.containsKey(puuid)) return;
-                    // FIX CRITICAL ANTI-DUP (P0-c): last line of defence — if the DB already
-                    // shows online=0, a logout save has committed and any write here would
-                    // resurrect stale data (cause of drop+deco+reco item duplication).
-                    try (JDBCsetUp.QueryResult onlineCheck = JDBCsetUp.executePreparedQuery(
-                            "SELECT online FROM " + Tables.playerData() + " WHERE uuid=?", puuid)) {
-                        ResultSet rs = onlineCheck.resultSet();
-                        if (rs.next() && rs.getInt("online") == 0) {
-                            SyncLogger.guardBlocked(puuid, JdbcConfig.SERVER_ID.get(),
-                                    "SaveToFile BG skipped — player already offline in DB (logout committed)");
-                            return;
-                        }
-                    }
-                    // PHASE 18: heavy NBT serialization now happens HERE on BG, not main.
-                    PlayerDataSnapshot snapshot = frozen.materialize();
-                    // PHASE 7 PERF: skip write when snapshot hashes identical to last-written.
-                    int newHash = computeSnapshotHash(snapshot);
-                    Integer prev = lastWrittenSnapshotHash.get(puuid);
-                    if (prev != null && prev == newHash) {
-                        return; // identical — no DB write needed
-                    }
-                    if (writeSnapshotToDB(snapshot)) {
-                        lastWrittenSnapshotHash.put(puuid, newHash);
-                    }
-                } catch (Exception e) {
-                    PlayerSync.LOGGER.error("Error writing async SaveToFile snapshot for player {}", puuid, e);
-                } finally {
-                    bgLock.unlock();
-                }
-            });
-
+            queuePeriodicWrite(puuid, joinSessions.get(puuid), frozen, null, label);
         } catch (Exception e) {
-            PlayerSync.LOGGER.error("Error snapshotting player {} for SaveToFile", puuid, e);
-        } finally {
-            lock.unlock(); // main thread releases → background thread can now acquire
+            PlayerSync.LOGGER.error("Error snapshotting player {} for {}", puuid, label, e);
         }
+    }
+
+    /**
+     * Background half of every periodic save (staggered auto-save, dimension change,
+     * respawn, admin flush). One implementation so the guard stack can no longer drift
+     * between paths.
+     *
+     * <p>Guards, in order:
+     * <ul>
+     *   <li>the login session captured with the snapshot must still be current — a save
+     *       queued before a logout, or before a quick leave + rejoin, describes a session
+     *       that is over (2.2.0: replaces {@code playerLocks.containsKey}, which a rejoin
+     *       re-created and which the staggered auto-save never checked);</li>
+     *   <li>no logout save pending, re-checked under the per-player lock (P0-a / P0-b);</li>
+     *   <li>{@code online=1 AND last_server=self} enforced INSIDE the UPDATE (P0-c). The
+     *       separate {@code SELECT online} pre-check that used to do this left a gap between
+     *       the check and the write and cost a round trip per save.</li>
+     * </ul>
+     *
+     * @param storages carried-container blobs to write with the player row, or null
+     */
+    private static void queuePeriodicWrite(String puuid, Object session, DeferredPlayerSnapshot frozen,
+                                           Map<UUID, CompoundTag> storages, String label) {
+        if (session == null) return;
+        executorService.submit(() -> {
+            if (!isJoinSessionCurrent(puuid, session)) return;
+            // FIX CRITICAL ANTI-DUP (P0-a): early skip if logout is already in flight.
+            if (pendingLogoutSaves.containsKey(puuid)) return;
+            ReentrantLock bgLock = getPlayerLock(puuid);
+            if (!bgLock.tryLock()) return; // another save is writing this player right now
+            try {
+                // FIX CRITICAL ANTI-DUP (P0-b): re-check under lock — a logout task may
+                // have been submitted between the check above and tryLock success.
+                if (pendingLogoutSaves.containsKey(puuid) || !isJoinSessionCurrent(puuid, session)) return;
+                // PHASE 18: heavy NBT serialization runs HERE on BG, not main.
+                PlayerDataSnapshot snapshot = frozen.materialize();
+                // PHASE 7 PERF: skip the player row when it hashes identical to the last write.
+                int newHash = computeSnapshotHash(snapshot);
+                Integer prev = lastWrittenSnapshotHash.get(puuid);
+                if (prev != null && prev == newHash) {
+                    // AUDIT FIX (dup/perf): the core hash does NOT cover backpack/SS blobs.
+                    // A player moving items INSIDE a backpack leaves it unchanged, so the
+                    // changed containers are still written (guarded on their own).
+                    if (storages != null && !storages.isEmpty()) writeStoragesOnly(puuid, storages);
+                    return;
+                }
+                if (writeSnapshotToDB(snapshot, false, storages, true)) {
+                    lastWrittenSnapshotHash.put(puuid, newHash);
+                } else {
+                    SyncLogger.saveSkipped(puuid, label, "core guard blocked");
+                }
+            } catch (Exception e) {
+                PlayerSync.LOGGER.error("Error writing {} snapshot for player {}", label, puuid, e);
+            } finally {
+                bgLock.unlock();
+            }
+        });
+    }
+
+    /**
+     * Writes changed container blobs on their own, under {@code online=1 AND last_server=self}.
+     * Only the blobs whose upsert actually landed are recorded as written.
+     */
+    private static void writeStoragesOnly(String puuid, Map<UUID, CompoundTag> storages) throws SQLException {
+        ModsSupport.StorageWrite write = ModsSupport.prepareStorageWrite(
+                storages, true, puuid, JdbcConfig.SERVER_ID.get(), true);
+        if (write.isEmpty()) return;
+        int[] counts = JDBCsetUp.executeBatchTransaction(write.statements().toArray(new Object[0][]));
+        for (int i = 0; i < counts.length; i++) {
+            if (counts[i] != 0) write.markCommitted(i);
+        }
+    }
+
+    /**
+     * 2.2.0: set when the graceful stop begins and released once its saves are written. The
+     * JVM shutdown hook waits on it: on SIGINT / SIGTERM the server runs its own graceful
+     * stop at the same time as the hook, and the emergency flush used to read live entities
+     * from the hook thread and write them unlocked, racing the proper shutdown save.
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean gracefulShutdownStarted =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static final CountDownLatch gracefulShutdownDone = new CountDownLatch(1);
+    private static final long EMERGENCY_FLUSH_GRACE_SECONDS = 60L;
+    private static final long EMERGENCY_FLUSH_START_WAIT_MS = 5_000L;
+
+    /** What a final-state save (server stop, emergency flush) writes for one player. */
+    private enum FinalSave { SKIP, NORMAL, CLEAR_ITEMS }
+
+    /**
+     * The decision {@link #onPlayerLogout} takes, applied to a server stop.
+     *
+     * <p>2.2.0: the stop paths skipped dead players outright and saved fallen ones normally.
+     * A player on the death screen during a stop kept their pre-death inventory in the
+     * database while the drops stayed in the world, and a fallen player's full inventory was
+     * written right before Revive Me turned it into a corpse: both came back as duplicates
+     * on the next login. Players whose restore never completed are skipped as well — what
+     * they hold is the stale local copy.
+     */
+    private static FinalSave finalSaveFor(ServerPlayer player) {
+        String uuid = player.getUUID().toString();
+        if (!player.getTags().contains("player_synced") || syncNotCompletedPlayer.contains(uuid)) return FinalSave.SKIP;
+        boolean fallen = isReviveMeFallen(player);
+        boolean dead = player.isDeadOrDying();
+        if (!fallen && !dead) return FinalSave.NORMAL;
+        boolean keepInv;
+        try {
+            keepInv = player.serverLevel().getGameRules().getBoolean(net.minecraft.world.level.GameRules.RULE_KEEPINVENTORY);
+        } catch (Exception e) {
+            keepInv = false; // same fallback as the logout path
+        }
+        return keepInv ? FinalSave.NORMAL : FinalSave.CLEAR_ITEMS;
+    }
+
+    private static void releaseFlagOnShutdown(String uuid) {
+        executorService.execute(() -> {
+            try {
+                JDBCsetUp.executePreparedUpdate(
+                        "UPDATE " + Tables.playerData() + " SET online=0, logout_started_at=NULL WHERE uuid=? AND last_server=?",
+                        uuid, JdbcConfig.SERVER_ID.get());
+            } catch (SQLException e) {
+                PlayerSync.LOGGER.warn("Could not release unsynced player {} on shutdown: {}", uuid, e.getMessage());
+            }
+        });
+    }
+
+    /** Writes one final-state save. Background thread or shutdown hook; no entity access. */
+    private static boolean writeFinalSave(FinalSave mode, DeferredPlayerSnapshot frozen,
+                                          Map<UUID, CompoundTag> storages) throws Exception {
+        PlayerDataSnapshot snapshot = frozen.materialize();
+        return mode == FinalSave.CLEAR_ITEMS
+                ? writeReviveLogoutClearItemsToDB(snapshot)
+                : writeSnapshotToDB(snapshot, true, storages, false);
     }
 
     @SubscribeEvent
     public static void onServerShutdown(ServerStoppingEvent event) throws SQLException {
+        gracefulShutdownStarted.set(true);
+        try {
+            shutdownSaveAll();
+        } finally {
+            gracefulShutdownDone.countDown();
+        }
+    }
+
+    private static void shutdownSaveAll() throws SQLException {
         // FIX PERF: Snapshot ALL players on main thread (fast, no DB I/O), then write
         // ALL saves in PARALLEL on background threads. Previously this was sequential:
         // 35 players × 200ms = 7 seconds blocking the main thread → watchdog "server thread stuck".
@@ -1608,7 +1991,13 @@ public class VanillaSync {
             List<CompletableFuture<Void>> futures = new ArrayList<>();
 
             for (ServerPlayer player : server.getPlayerList().getPlayers()) {
-                if (!player.getTags().contains("player_synced") || player.isDeadOrDying()) continue;
+                final FinalSave mode = finalSaveFor(player);
+                if (mode == FinalSave.SKIP) {
+                    // Nothing of this session may be written, but a claim this server holds
+                    // must not outlive it: peers would wait for our heartbeat to go stale.
+                    releaseFlagOnShutdown(player.getUUID().toString());
+                    continue;
+                }
 
                 String puuid = player.getUUID().toString();
                 try {
@@ -1617,21 +2006,26 @@ public class VanillaSync {
                     final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
                     // Backpacks / Sophisticated Storage / RS2 disks are all captured here: their
                     // SavedData is not thread-safe and RS2 encoding must not run on the writer.
-                    final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
+                    // A corpse-bound player's containers follow the items into the corpse.
+                    final Map<UUID, CompoundTag> storageSnapshots =
+                            mode == FinalSave.NORMAL ? snapshotAllStorages(player) : Map.of();
 
                     // === BACKGROUND THREAD: DB writes (parallel across all players) ===
                     futures.add(CompletableFuture.runAsync(() -> {
                         long t0 = System.currentTimeMillis();
+                        // 2.2.0: wait for an auto-save of this player that is already writing,
+                        // so its older snapshot cannot commit after this one.
+                        ReentrantLock bgLock = getPlayerLock(puuid);
+                        bgLock.lock();
                         try {
-                            PlayerDataSnapshot snapshot = frozen.materialize();
-                            boolean persisted = writeSnapshotToDB(snapshot, true);
+                            boolean persisted = writeFinalSave(mode, frozen, storageSnapshots);
                             if (persisted) {
-                                ModsSupport.saveBackpackSnapshots(storageSnapshots);
                                 long dur = System.currentTimeMillis() - t0;
-                                PlayerSync.LOGGER.info("Saved player {} data on server shutdown in {}ms", puuid, dur);
-                                SyncLogger.saveCompleted(puuid, "SHUTDOWN", dur);
+                                PlayerSync.LOGGER.info("Saved player {} data on server shutdown in {}ms{}", puuid, dur,
+                                        mode == FinalSave.CLEAR_ITEMS ? " (fallen/dead: item columns cleared)" : "");
+                                SyncLogger.saveCompleted(puuid, mode == FinalSave.CLEAR_ITEMS ? "SHUTDOWN_FALLEN" : "SHUTDOWN", dur);
                             } else {
-                                PlayerSync.LOGGER.warn("Shutdown save: downstream backpack/SS/RS2 skipped for {} — core guard blocked", puuid);
+                                PlayerSync.LOGGER.warn("Shutdown save: core guard blocked for {} — nothing written", puuid);
                                 SyncLogger.saveSkipped(puuid, "SHUTDOWN", "core guard blocked");
                             }
                         } catch (Exception e) {
@@ -1642,13 +2036,14 @@ public class VanillaSync {
                             } catch (Exception e2) {
                                 PlayerSync.LOGGER.error("CRITICAL: Failed to mark player {} offline on shutdown", puuid, e2);
                             }
+                        } finally {
+                            bgLock.unlock();
                         }
                     }, executorService));
 
                 } catch (Exception e) {
                     PlayerSync.LOGGER.error("Error snapshotting player {} on shutdown", puuid, e);
-                    try { JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.playerData() + " SET online=0 WHERE uuid=? AND last_server=?", puuid, JdbcConfig.SERVER_ID.get()); }
-                    catch (Exception ignored) {}
+                    markOfflineIfOwned(puuid, "player after a failed shutdown snapshot");
                 }
             }
 
@@ -1675,7 +2070,10 @@ public class VanillaSync {
         // Phase 5: stop pool-stats reporter.
         vip.fubuki.playersync.util.PoolStatsReporter.stop();
 
-        // Shut down the background executor — no new tasks after this point
+        // Shut down the background executors — no new tasks after this point.
+        // Join tasks only wait and poll; interrupting them loses nothing (no claim is taken
+        // for a session that cannot be restored any more).
+        joinExecutor.shutdownNow();
         executorService.shutdown();
         try {
             if (!executorService.awaitTermination(5, TimeUnit.SECONDS)) {
@@ -1705,13 +2103,16 @@ public class VanillaSync {
     }
 
     /**
-     * Phase 3 emergency flush invoked from the JVM shutdown hook (kill -9, OOM, host
-     * reboot) when {@code onServerShutdown} never ran. Runs on the JVM shutdown thread,
-     * synchronously, WITHOUT the executor (which may be already draining or dead).
+     * Emergency flush invoked from the JVM shutdown hook when the graceful stop did not save
+     * the players (main thread hung, JVM exiting on a fatal error). Runs on the hook thread,
+     * synchronously, WITHOUT the executor.
      *
-     * <p>Best-effort: snapshots and writes every still-online player using direct
-     * DB calls. No lock acquisition — the server is dying, we just want data on disk.
-     * If the DB pool is already closed, we log and exit gracefully.
+     * <p>A {@code kill -9} runs no hook at all; that case is covered at the next boot by
+     * {@code CrashRecovery.clearOrphanedOnlineFlags}.
+     *
+     * <p>2.2.0: on SIGINT / SIGTERM the server stops gracefully in parallel with this hook.
+     * The flush now waits for that graceful stop and only runs if it did not finish, instead
+     * of reading live entities from this thread while the server was still saving them.
      */
     public static void emergencyFlushAll() {
         try {
@@ -1720,18 +2121,40 @@ public class VanillaSync {
                 PlayerSync.LOGGER.warn("[emergency-flush] no server instance — nothing to flush");
                 return;
             }
+            // On SIGINT / SIGTERM the server's own hook starts the graceful stop within a
+            // moment. A hung main thread (watchdog exit) never starts it, and must be flushed
+            // straight away: hosting panels kill the process 10-30 s after the signal.
+            try {
+                long startDeadline = System.currentTimeMillis() + EMERGENCY_FLUSH_START_WAIT_MS;
+                while (!gracefulShutdownStarted.get() && server.getRunningThread().isAlive()
+                        && System.currentTimeMillis() < startDeadline) {
+                    Thread.sleep(100L);
+                }
+                if (gracefulShutdownStarted.get()) {
+                    if (gracefulShutdownDone.await(EMERGENCY_FLUSH_GRACE_SECONDS, TimeUnit.SECONDS)) {
+                        // The graceful path ran to its end (and closed the pool): whatever it
+                        // could save is saved, the hook has nothing left to write with.
+                        PlayerSync.LOGGER.info("[emergency-flush] graceful shutdown finished — nothing to flush");
+                        return;
+                    }
+                    PlayerSync.LOGGER.warn("[emergency-flush] graceful shutdown did not finish within {}s — flushing from the hook",
+                            EMERGENCY_FLUSH_GRACE_SECONDS);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
             int flushed = 0;
-            for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            for (ServerPlayer player : new ArrayList<>(server.getPlayerList().getPlayers())) {
                 String puuid = player.getUUID().toString();
-                if (!player.getTags().contains("player_synced") || player.isDeadOrDying()) continue;
+                FinalSave mode = finalSaveFor(player);
+                if (mode == FinalSave.SKIP) continue;
                 try {
                     final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
-                    final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
+                    final Map<UUID, CompoundTag> storageSnapshots =
+                            mode == FinalSave.NORMAL ? snapshotAllStorages(player) : Map.of();
                     // Direct synchronous write (no executor, no lock) — materialize inline.
-                    PlayerDataSnapshot snapshot = frozen.materialize();
-                    boolean persisted = writeSnapshotToDB(snapshot, true);
+                    boolean persisted = writeFinalSave(mode, frozen, storageSnapshots);
                     if (persisted) {
-                        ModsSupport.saveBackpackSnapshots(storageSnapshots);
                         SyncLogger.saveCompleted(puuid, "EMERGENCY_FLUSH", 0);
                         flushed++;
                     } else {
@@ -1765,6 +2188,8 @@ public class VanillaSync {
     @SubscribeEvent
     public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
         String player_uuid = event.getEntity().getUUID().toString();
+        // Any join task still running for this login now knows its player is gone.
+        joinSessions.remove(player_uuid);
 
         // Players kicked for duplicate login must NOT set online=0 — they're still
         // online on the OTHER server.
@@ -1779,29 +2204,22 @@ public class VanillaSync {
         if (deadPlayerWhileLogging.remove(player_uuid)) {
             PlayerSync.LOGGER.warn("A dead or dying player was kicked, uuid: {}", player_uuid);
             // FIX PERF (C1): async — main thread does not wait for MySQL.
-            executorService.execute(() -> {
-                try {
-                    JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.playerData() + " SET online=0 WHERE uuid=?", player_uuid);
-                } catch (SQLException e) {
-                    PlayerSync.LOGGER.error("Error marking dead player offline: {}", player_uuid, e);
-                }
-            });
+            markOfflineIfOwned(player_uuid, "dead player");
             syncNotCompletedPlayer.remove(player_uuid);
             removePlayerLock(player_uuid);
             return;
         }
 
-        if (syncNotCompletedPlayer.remove(player_uuid)) {
+        // 2.2.0: "player_synced" is stripped at login and only set once the restore has
+        // replaced the .dat state, so a session without it never restored anything. Its
+        // state is the stale local copy and must not be written, exactly like a session
+        // still marked sync-pending.
+        boolean neverRestored = !event.getEntity().getTags().contains("player_synced");
+        if (syncNotCompletedPlayer.remove(player_uuid) || neverRestored) {
             PlayerSync.LOGGER.warn("Player {} logged out with uncompleted sync. Data won't be saved for safety.", player_uuid);
             SyncLogger.saveSkipped(player_uuid, "LOGOUT", "Sync not completed — data preserved in DB, .dat data discarded");
             // FIX PERF (C1): async.
-            executorService.execute(() -> {
-                try {
-                    JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.playerData() + " SET online=0 WHERE uuid=?", player_uuid);
-                } catch (SQLException e) {
-                    PlayerSync.LOGGER.error("Error marking unsynced player offline: {}", player_uuid, e);
-                }
-            });
+            markOfflineIfOwned(player_uuid, "unsynced player");
             removePlayerLock(player_uuid);
             return;
         }
@@ -1860,9 +2278,18 @@ public class VanillaSync {
         }
 
         // === Normal save path ===
+        // 2.2.0: no per-player lock on the MAIN thread any more. Background auto-save,
+        // SaveToFile and death tasks hold that lock across their JDBC transaction, so a
+        // logout landing on one of them froze the tick for the whole write (up to the
+        // socket timeout on a struggling database). It added no ordering: the background
+        // logout task below takes the same lock BLOCKING before writing, and
+        // pendingLogoutSaves is registered before that task is submitted. Both orders:
+        //  - auto-save holds the lock first: it writes its older snapshot, releases, then
+        //    the logout task writes the newer one (last writer wins = logout);
+        //  - logout task holds it first: the auto-save's tryLock fails, or it acquires
+        //    afterwards and its re-check sees the pending logout / the committed online=0
+        //    (now also enforced inside its UPDATE) and skips.
         Player player = event.getEntity();
-        ReentrantLock lock = getPlayerLock(player_uuid);
-        lock.lock();
         // Declared outside the try so the outer catch can complete/remove the future
         // if snapshot capture or task submission fails (see FIX REGRESSION below).
         CompletableFuture<Void> saveFuture = null;
@@ -1944,25 +2371,25 @@ public class VanillaSync {
             saveFuture = new CompletableFuture<>();
             pendingLogoutSaves.put(player_uuid, saveFuture);
 
-            // PHASE 15: mark logout-in-progress for cross-server visibility. Joining servers
-            // read this column to distinguish 'peer saving' from 'ghost session' — a fresh
-            // timestamp here means we're committing shortly, a stale or NULL value means
-            // either no save in progress (clean/new player) or the save thread died. The
-            // async save clears this atomically with online=0 when it commits.
-            try {
-                JDBCsetUp.executePreparedUpdate(
-                        "UPDATE " + Tables.playerData() + " SET logout_started_at=? WHERE uuid=?",
-                        System.currentTimeMillis(), player_uuid);
-            } catch (Exception e) {
-                PlayerSync.LOGGER.warn("[phase15] could not mark logout_started_at for {}: {}", player_uuid, e.getMessage());
-            }
-
             final CompletableFuture<Void> futureRef = saveFuture;
             // FIX REGRESSION: handle RejectedExecutionException if the executor is
             // already shut down (concurrent with server stop). Without this, the future
             // stays forever in pendingLogoutSaves and blocks future rejoins for 15s+.
+            // 2.2.0: the backpressure policy drops tasks silently once the executor is shut
+            // down instead of throwing, so the check has to be explicit.
             try {
+                if (executorService.isShutdown()) {
+                    throw new java.util.concurrent.RejectedExecutionException("executor shut down");
+                }
                 executorService.execute(() -> {
+                // PHASE 15: mark logout-in-progress for cross-server visibility. Joining
+                // servers read this column to distinguish 'peer saving' from 'ghost session'.
+                // 2.2.0: stamped here, when the save actually starts, instead of on the main
+                // thread when it was queued: that was a blocking JDBC call on every logout,
+                // and a save waiting in a busy queue looked "stalled" to peers after 10 s and
+                // got its ownership force-claimed away. Guarded so it can never touch a row
+                // another server has claimed meanwhile.
+                markLogoutStarted(player_uuid);
                 // FIX CRITICAL ANTI-DUP (P0-d): acquire bgLock BEFORE any DB write so
                 // concurrent SaveToFile / death-save BG tasks (using tryLock) either skip
                 // cleanly OR wait until this logout finishes. Without this, a stale
@@ -1976,11 +2403,11 @@ public class VanillaSync {
                     final long t0 = System.currentTimeMillis();
                     // PHASE 18: heavy NBT serialization runs on BG, not main thread.
                     PlayerDataSnapshot snapshot = frozen.materialize();
-                    boolean persisted = writeSnapshotToDB(snapshot, true);
+                    // Player row and carried containers commit together (see StorageWrite).
+                    boolean persisted = writeSnapshotToDB(snapshot, true, storageSnapshots, false);
                     final long tCore = System.currentTimeMillis();
                     if (persisted) {
                         lastWrittenSnapshotHash.put(player_uuid, computeSnapshotHash(snapshot));
-                        ModsSupport.saveBackpackSnapshots(storageSnapshots);
                         final long tEnd = System.currentTimeMillis();
                         long total = tEnd - t0;
                         PlayerSync.LOGGER.info("Logout save completed for player {} in {}ms", player_uuid, total);
@@ -1988,7 +2415,7 @@ public class VanillaSync {
                         SyncLogger.perf("LOGOUT breakdown [" + player_uuid + "]",
                                 (tCore - t0));
                         if (total > 200) {
-                            String detail = "core=" + (tCore - t0) + "ms storage=" + (tEnd - tCore)
+                            String detail = "write=" + (tCore - t0)
                                     + "ms blobs=" + storageSnapshots.size() + " total=" + total + "ms";
                             PlayerSync.LOGGER.info("[perf-logout] {} {}", player_uuid, detail);
                             // PHASE 11: also log to sync.log so field reports don't miss the breakdown.
@@ -2030,8 +2457,7 @@ public class VanillaSync {
 
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Error during player logout save for {}", player_uuid, e);
-            try { JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.playerData() + " SET online=0 WHERE uuid=? AND last_server=?", player_uuid, JdbcConfig.SERVER_ID.get()); }
-            catch (Exception ignored) {}
+            markOfflineIfOwned(player_uuid, "player after a failed logout snapshot");
             removePlayerLock(player_uuid);
             // FIX REGRESSION: if snapshot failed AFTER pendingLogoutSaves.put, complete
             // the future so a rejoining doPlayerJoin doesn't hang 15 s on .get().
@@ -2039,8 +2465,17 @@ public class VanillaSync {
                 pendingLogoutSaves.remove(player_uuid);
                 saveFuture.completeExceptionally(e);
             }
-        } finally {
-            lock.unlock();
+        }
+    }
+
+    /** Stamps logout_started_at for peers, on the executor. Best effort. */
+    private static void markLogoutStarted(String uuid) {
+        try {
+            JDBCsetUp.executePreparedUpdate(
+                    "UPDATE " + Tables.playerData() + " SET logout_started_at=? WHERE uuid=? AND last_server=?",
+                    System.currentTimeMillis(), uuid, JdbcConfig.SERVER_ID.get());
+        } catch (Exception e) {
+            PlayerSync.LOGGER.warn("[phase15] could not mark logout_started_at for {}: {}", uuid, e.getMessage());
         }
     }
 
@@ -2063,8 +2498,7 @@ public class VanillaSync {
         SyncLogger.playerEvent(player_uuid, "LOGOUT_FALLEN",
                 "Disconnect while fallen/dead — DB item columns cleared (corpse dup prevention)");
 
-        ReentrantLock lock = getPlayerLock(player_uuid);
-        lock.lock();
+        // 2.2.0: no main-thread lock, same reasoning as the normal logout path.
         CompletableFuture<Void> saveFuture = null;
         try {
             // Snapshot non-item progression. The deferred item arrays are captured too
@@ -2075,17 +2509,13 @@ public class VanillaSync {
             saveFuture = new CompletableFuture<>();
             pendingLogoutSaves.put(player_uuid, saveFuture);
 
-            try {
-                JDBCsetUp.executePreparedUpdate(
-                        "UPDATE " + Tables.playerData() + " SET logout_started_at=? WHERE uuid=?",
-                        System.currentTimeMillis(), player_uuid);
-            } catch (Exception e) {
-                PlayerSync.LOGGER.warn("[revive-logout] could not mark logout_started_at for {}: {}", player_uuid, e.getMessage());
-            }
-
             final CompletableFuture<Void> futureRef = saveFuture;
             try {
+                if (executorService.isShutdown()) {
+                    throw new java.util.concurrent.RejectedExecutionException("executor shut down");
+                }
                 executorService.execute(() -> {
+                    markLogoutStarted(player_uuid);
                     ReentrantLock bgLock = getPlayerLock(player_uuid);
                     bgLock.lock();
                     try {
@@ -2126,24 +2556,21 @@ public class VanillaSync {
             }
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Error during fallen-logout for {}", player_uuid, e);
-            try {
-                JDBCsetUp.executePreparedUpdate(
-                        "UPDATE " + Tables.playerData() + " SET online=0, logout_started_at=NULL WHERE uuid=? AND last_server=?",
-                        player_uuid, JdbcConfig.SERVER_ID.get());
-            } catch (Exception ignored) {}
+            markOfflineIfOwned(player_uuid, "player after a failed fallen-logout snapshot");
             removePlayerLock(player_uuid);
             if (saveFuture != null) {
                 pendingLogoutSaves.remove(player_uuid);
                 saveFuture.completeExceptionally(e);
             }
-        } finally {
-            lock.unlock();
         }
     }
 
     // Helper function to get the NBT string to be saved
     // If item is a placeholder, get original NBT; otherwise, get current NBT
     public static String getNbtForStorage(ItemStack itemStack) {
+        // 2.2.0: every empty slot used to be gzipped from scratch on every save (~45 per
+        // player per save). The bytes are identical each time — compute them once.
+        if (itemStack == null || itemStack.isEmpty()) return emptySlotNbt();
         if (itemStack.is(Items.PAPER) && itemStack.getComponents().has(DataComponents.CUSTOM_DATA)
                 && itemStack.getComponents().get(DataComponents.CUSTOM_DATA).contains("playersync:original_item_nbt")) {
             // It's our placeholder, retrieve the original NBT string
@@ -2157,6 +2584,18 @@ public class VanillaSync {
             // Fallback to SNBT-based serialization for non-compound tags
             return serialize(tag.toString());
         }
+    }
+
+    private static volatile String EMPTY_SLOT_NBT;
+
+    private static String emptySlotNbt() {
+        String cached = EMPTY_SLOT_NBT;
+        if (cached == null) {
+            // Same path as before: an empty stack serializes to an empty CompoundTag.
+            cached = serializeTagToBinaryBase64(new CompoundTag());
+            EMPTY_SLOT_NBT = cached;
+        }
+        return cached;
     }
 
     /**
@@ -2237,8 +2676,10 @@ public class VanillaSync {
     record DeferredPlayerSnapshot(
             String uuid, int xp, int score, int foodLevel, int health,
             String effects, String advancements,
-            String curiosData, String accessoriesData, String cosmeticArmorData, String attachmentsData,
-            String persistentData,
+            // 2.2.0: mod data is deferred too — slot copies and detached tags captured on
+            // main, gzip + Base64 on BG. Null means "do not write" (see each capture method).
+            Map<String, ItemStack> curios, Map<String, ItemStack> accessories, Map<Integer, ItemStack> cosmeticArmor,
+            CompoundTag attachments, CompoundTag persistentData,
             // Deferred — ItemStack copies, serialized to strings on BG via materialize()
             ItemStack leftHand, ItemStack cursors,
             ItemStack[] armor, ItemStack[] inventory, ItemStack[] enderChest
@@ -2262,7 +2703,9 @@ public class VanillaSync {
                     leftHandStr, cursorsStr,
                     armorMap.toString(), inventoryMap.toString(), enderChestMap.toString(), effects,
                     advancements,
-                    curiosData, accessoriesData, cosmeticArmorData, attachmentsData, persistentData
+                    ModCompatSync.serializeSlots(curios), ModCompatSync.serializeSlots(accessories),
+                    ModCompatSync.serializeSlots(cosmeticArmor),
+                    ModCompatSync.serializeTag(attachments), ModCompatSync.serializeTag(persistentData)
             );
         }
     }
@@ -2381,14 +2824,15 @@ public class VanillaSync {
 
         // Mod data snapshots — entity reads, MUST be on main thread.
         // These are included in the snapshot so the background writer can persist them
-        // without touching the entity again.
-        String curiosData = ModList.get().isLoaded("curios") && !player.isDeadOrDying()
-                ? ModsSupport.snapshotCuriosData(player) : null;
-        String accessoriesData = ModCompatSync.snapshotAccessories(player);
-        String cosmeticArmorData = ModCompatSync.snapshotCosmeticArmor(player);
-        String attachmentsData = ModCompatSync.snapshotAttachments(player);
+        // without touching the entity again. Only copies are taken here; serialization
+        // happens in materialize() on the writer thread.
+        Map<String, ItemStack> curios = ModList.get().isLoaded("curios") && !player.isDeadOrDying()
+                ? ModsSupport.captureCurios(player) : null;
+        Map<String, ItemStack> accessories = ModCompatSync.captureAccessories(player);
+        Map<Integer, ItemStack> cosmeticArmor = ModCompatSync.captureCosmeticArmor(player);
+        CompoundTag attachments = ModCompatSync.captureAttachments(player);
         // Legacy persistent-data scratchpad (Corail Tombstone progression lives here).
-        String persistentData = ModCompatSync.snapshotPersistentData(player);
+        CompoundTag persistentData = ModCompatSync.capturePersistentData(player);
 
         // NOTE: Sophisticated Backpacks/Storage/RS2 saves are intentionally NOT in the
         // periodic snapshot — their contents live in server-side SavedData and are
@@ -2397,7 +2841,7 @@ public class VanillaSync {
         return new DeferredPlayerSnapshot(
                 uuid, XP, score, foodLevel, health,
                 effectMap.toString(), advancements,
-                curiosData, accessoriesData, cosmeticArmorData, attachmentsData, persistentData,
+                curios, accessories, cosmeticArmor, attachments, persistentData,
                 leftHandStack, cursorsStack, armor, inventory, enderChest
         );
     }
@@ -2430,10 +2874,22 @@ public class VanillaSync {
      *         server's data. See P0-2 audit finding.
      */
     private static boolean writeSnapshotToDB(PlayerDataSnapshot s, boolean setOffline) throws Exception {
+        return writeSnapshotToDB(s, setOffline, null, false);
+    }
+
+    /**
+     * @param storages              carried-container blobs captured with the snapshot, written
+     *                              in the same transaction (may be null)
+     * @param skipUnchangedStorages skip blobs identical to the last written ones — periodic
+     *                              saves only; final-state saves must pass false
+     */
+    private static boolean writeSnapshotToDB(PlayerDataSnapshot s, boolean setOffline,
+                                             Map<UUID, CompoundTag> storages, boolean skipUnchangedStorages) throws Exception {
         int serverId = JdbcConfig.SERVER_ID.get();
 
         // PHASE 8: safety guards — abort before corrupting DB with garbage or wipes.
-        if (JdbcConfig.REFUSE_EMPTY_INVENTORY_WRITE.get()
+        // (Not applicable when the inventory is not synced here: nothing is written to it.)
+        if (JdbcConfig.SYNC_INVENTORY.get() && JdbcConfig.REFUSE_EMPTY_INVENTORY_WRITE.get()
                 && (s.inventory() == null || s.inventory().isEmpty() || s.inventory().length() < 4)) {
             // Only skip if DB currently has real data — new players legitimately have empty inventories
             try (JDBCsetUp.QueryResult qr = JDBCsetUp.executePreparedQuery(
@@ -2461,18 +2917,47 @@ public class VanillaSync {
         // Previously 4-8 separate connections × round-trips per player.
         // Now: 1 connection, 1 commit, automatic rollback on failure.
         String serverGuard = "(last_server=? OR last_server IS NULL)";
-        String coreSql = setOffline
+        // 2.2.0: every data column goes through COALESCE so a NULL bind keeps the stored
+        // value. That is how a disabled [sync_toggles] category is left alone (the servers
+        // that do sync it keep their data) and how an unchanged advancements blob is not
+        // re-sent on every periodic save.
+        // A periodic save also requires online=1 inside the UPDATE itself: once a logout
+        // has committed online=0, an older snapshot still queued can no longer land on top
+        // of it. Only the background pre-check enforced that before, with a gap between
+        // the check and the write.
+        String coreSql = "UPDATE " + Tables.playerData() + " SET inventory=COALESCE(?, inventory), armor=COALESCE(?, armor),"
+                + " xp=COALESCE(?, xp), effects=COALESCE(?, effects), enderchest=COALESCE(?, enderchest),"
+                + " score=COALESCE(?, score), food_level=COALESCE(?, food_level), health=COALESCE(?, health),"
+                + " advancements=COALESCE(?, advancements), left_hand=COALESCE(?, left_hand), cursors=COALESCE(?, cursors),"
                 // PHASE 15: atomic clear of logout_started_at when the logout save commits.
                 // Joining servers see logout_started_at=NULL + online=0 = clean, take over instantly.
-                ? "UPDATE " + Tables.playerData() + " SET inventory=?, armor=?, xp=?, effects=?, enderchest=?, score=?, food_level=?, health=?, advancements=COALESCE(?, advancements), left_hand=?, cursors=?, online=0, last_server=?, logout_started_at=NULL WHERE uuid=? AND " + serverGuard
-                : "UPDATE " + Tables.playerData() + " SET inventory=?, armor=?, xp=?, effects=?, enderchest=?, score=?, food_level=?, health=?, advancements=COALESCE(?, advancements), left_hand=?, cursors=?, last_server=? WHERE uuid=? AND " + serverGuard;
+                + (setOffline ? " online=0, last_server=?, logout_started_at=NULL" : " last_server=?")
+                + " WHERE uuid=? AND " + serverGuard + (setOffline ? "" : " AND online=1");
+
+        final boolean syncInventory = JdbcConfig.SYNC_INVENTORY.get();
+        final boolean syncEnderChest = JdbcConfig.SYNC_ENDER_CHEST.get();
+        final boolean syncXp = JdbcConfig.SYNC_XP.get();
+        final boolean syncEffects = JdbcConfig.SYNC_EFFECTS.get();
+        final boolean syncHealthFood = JdbcConfig.SYNC_HEALTH_FOOD.get();
+        // Final-state saves (logout / shutdown) always carry the advancements.
+        final String advancements = setOffline ? s.advancements() : advancementsIfChanged(s.uuid(), s.advancements());
 
         // Build batch of all statements
         List<Object[]> batch = new ArrayList<>();
 
         // 1. Core player data
         batch.add(new Object[]{coreSql,
-                s.inventory(), s.equipment(), s.xp(), s.effects(), s.enderChest(), s.score(), s.foodLevel(), s.health(), s.advancements(), s.leftHand(), s.cursors(), serverId, s.uuid(), serverId});
+                syncInventory ? s.inventory() : null, syncInventory ? s.equipment() : null,
+                syncXp ? s.xp() : null, syncEffects ? s.effects() : null, syncEnderChest ? s.enderChest() : null,
+                syncXp ? s.score() : null, syncHealthFood ? s.foodLevel() : null, syncHealthFood ? s.health() : null,
+                advancements, syncInventory ? s.leftHand() : null, syncInventory ? s.cursors() : null,
+                serverId, s.uuid(), serverId});
+
+        // Side rows follow the core row's guard. A periodic save also needs online=1 here:
+        // these upserts must not land after a logout committed, any more than the core row.
+        // (The logout's own UPDATE sets online=0 earlier in the same transaction, so the
+        // final-state saves keep the last_server guard alone.)
+        final String rowGuard = setOffline ? serverGuard : serverGuard + " AND online=1";
 
         // 2. Curios
         // AUDIT FIX (batching): single guarded upsert instead of UPDATE + INSERT IGNORE
@@ -2481,22 +2966,55 @@ public class VanillaSync {
         if (s.curiosData() != null) {
             batch.add(new Object[]{
                     "INSERT INTO " + Tables.curios() + " (uuid, curios_item) SELECT ?, ? FROM " + Tables.playerData()
-                            + " WHERE uuid=? AND " + serverGuard
+                            + " WHERE uuid=? AND " + rowGuard
                             + " ON DUPLICATE KEY UPDATE curios_item=VALUES(curios_item)",
                     s.uuid(), s.curiosData(), s.uuid(), serverId});
         }
 
         // 3. Mod compat data (Accessories, CosmeticArmor, NeoForge attachments)
-        addModDataToBatch(batch, s.uuid(), "accessories", s.accessoriesData(), serverId, serverGuard);
-        addModDataToBatch(batch, s.uuid(), "cosmeticarmor", s.cosmeticArmorData(), serverId, serverGuard);
-        addModDataToBatch(batch, s.uuid(), "neoforge_attachments", s.attachmentsData(), serverId, serverGuard);
-        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, serverGuard);
+        addModDataToBatch(batch, s.uuid(), "accessories", s.accessoriesData(), serverId, rowGuard);
+        addModDataToBatch(batch, s.uuid(), "cosmeticarmor", s.cosmeticArmorData(), serverId, rowGuard);
+        addModDataToBatch(batch, s.uuid(), "neoforge_attachments", s.attachmentsData(), serverId, rowGuard);
+        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, rowGuard);
 
         // Execute all in one transaction. First statement is the core UPDATE on
         // player_data — if it affects 0 rows, the last_server guard blocked the write
         // (another server already claimed this player). Logging this is crucial for
         // diagnosing silent data-loss scenarios that were previously invisible.
-        int[] counts = JDBCsetUp.executeBatchTransaction(batch.toArray(new Object[0][]));
+        // 4. Carried containers, in the SAME commit as the core row (see StorageWrite).
+        //    Each upsert re-checks last_server, which the core UPDATE above has just set
+        //    when it passed its own guard, so a blocked core write blocks them as well.
+        final ModsSupport.StorageWrite storageWrite = ModsSupport.prepareStorageWrite(
+                storages, skipUnchangedStorages, s.uuid(), serverId, !setOffline);
+        final int coreStatements = batch.size();
+        batch.addAll(storageWrite.statements());
+
+        int[] counts;
+        try {
+            counts = JDBCsetUp.executeBatchTransaction(batch.toArray(new Object[0][]));
+            if (counts.length > 0 && counts[0] > 0) storageWrite.markCommitted();
+        } catch (SQLException e) {
+            if (storageWrite.isEmpty()) throw e;
+            // One bad container blob (oversized packet, say) must not cost the player the
+            // whole save. Commit the player first, then the containers one by one, still
+            // guarded — the behaviour before containers joined the transaction.
+            PlayerSync.LOGGER.error("Save transaction with {} container blob(s) failed for {} — retrying the player row alone",
+                    storageWrite.size(), s.uuid(), e);
+            counts = JDBCsetUp.executeBatchTransaction(batch.subList(0, coreStatements).toArray(new Object[0][]));
+            if (counts.length > 0 && counts[0] > 0) {
+                List<Object[]> storageStatements = storageWrite.statements();
+                for (int i = 0; i < storageStatements.size(); i++) {
+                    Object[] stmt = storageStatements.get(i);
+                    try {
+                        JDBCsetUp.executePreparedUpdate((String) stmt[0], stmt[1], stmt[2], stmt[3], stmt[4]);
+                        storageWrite.markCommitted(i);
+                    } catch (Exception e2) {
+                        PlayerSync.LOGGER.error("[save-storage] container {} could not be saved for {}", stmt[1], s.uuid(), e2);
+                        SyncLogger.saveFailed(s.uuid(), "STORAGE", "container " + stmt[1] + ": " + e2.getMessage());
+                    }
+                }
+            }
+        }
         if (counts.length > 0 && counts[0] == 0) {
             SyncLogger.guardBlocked(s.uuid(), serverId,
                     "core UPDATE affected 0 rows — player_data.last_server no longer matches this server or row was removed");
@@ -2505,7 +3023,36 @@ public class VanillaSync {
                     s.uuid(), serverId);
             return false;
         }
+        if (advancements != null) rememberWrittenAdvancements(s.uuid(), advancements);
         return true;
+    }
+
+    /**
+     * Fingerprint of the advancements blob last committed for each online player. The blob
+     * runs from 100 KB to over 1 MB on a large modpack and rarely changes between two
+     * periodic saves, yet it was re-sent with every one of them. Kept as a fingerprint, not
+     * the string itself, so 35 players do not pin 35 MB of JSON. Only ever used to skip a
+     * periodic write: logout and shutdown always send the full blob.
+     */
+    private record AdvancementsFingerprint(int length, int hash, long crc) {
+        static AdvancementsFingerprint of(String s) {
+            java.util.zip.CRC32 crc = new java.util.zip.CRC32();
+            crc.update(s.getBytes(StandardCharsets.UTF_8));
+            return new AdvancementsFingerprint(s.length(), s.hashCode(), crc.getValue());
+        }
+    }
+
+    private static final ConcurrentHashMap<String, AdvancementsFingerprint> lastWrittenAdvancements = new ConcurrentHashMap<>();
+
+    /** @return the blob to bind, or null (keep the stored value) when it is unchanged. */
+    private static String advancementsIfChanged(String uuid, String advancements) {
+        if (advancements == null) return null;
+        AdvancementsFingerprint last = lastWrittenAdvancements.get(uuid);
+        return last != null && last.equals(AdvancementsFingerprint.of(advancements)) ? null : advancements;
+    }
+
+    private static void rememberWrittenAdvancements(String uuid, String advancements) {
+        lastWrittenAdvancements.put(uuid, AdvancementsFingerprint.of(advancements));
     }
 
     private static void addModDataToBatch(List<Object[]> batch, String uuid, String modId, String data, int serverId, String serverGuard) {
@@ -2625,24 +3172,31 @@ public class VanillaSync {
     private static boolean writeNonItemSnapshotToDB(PlayerDataSnapshot s) throws Exception {
         int serverId = JdbcConfig.SERVER_ID.get();
         String serverGuard = "(last_server=? OR last_server IS NULL)";
+        // 2.2.0: same COALESCE / online=1 rules as writeSnapshotToDB's periodic UPDATE.
         String sql = "UPDATE " + Tables.playerData()
-                + " SET xp=?, effects=?, score=?, food_level=?, health=?,"
+                + " SET xp=COALESCE(?, xp), effects=COALESCE(?, effects), score=COALESCE(?, score),"
+                + "     food_level=COALESCE(?, food_level), health=COALESCE(?, health),"
                 + "     advancements=COALESCE(?, advancements), last_server=?"
-                + " WHERE uuid=? AND " + serverGuard;
+                + " WHERE uuid=? AND " + serverGuard + " AND online=1";
+        final boolean syncXp = JdbcConfig.SYNC_XP.get();
+        final boolean syncHealthFood = JdbcConfig.SYNC_HEALTH_FOOD.get();
+        final String advancements = advancementsIfChanged(s.uuid(), s.advancements());
         List<Object[]> batch = new ArrayList<>(2);
         batch.add(new Object[]{sql,
-                s.xp(), s.effects(), s.score(), s.foodLevel(), s.health(),
-                s.advancements(), serverId,
+                syncXp ? s.xp() : null, JdbcConfig.SYNC_EFFECTS.get() ? s.effects() : null, syncXp ? s.score() : null,
+                syncHealthFood ? s.foodLevel() : null, syncHealthFood ? s.health() : null,
+                advancements, serverId,
                 s.uuid(), serverId});
         // Death is exactly when Corail Tombstone rewrites knowledge / alignment, so the
         // persistent-data blob belongs in the non-item death save.
-        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, serverGuard);
+        addModDataToBatch(batch, s.uuid(), "persistent_data", s.persistentData(), serverId, serverGuard + " AND online=1");
         int[] counts = JDBCsetUp.executeBatchTransaction(batch.toArray(new Object[0][]));
         if (counts.length > 0 && counts[0] == 0) {
             SyncLogger.guardBlocked(s.uuid(), serverId,
-                    "death-save non-item UPDATE affected 0 rows — last_server mismatch");
+                    "death-save non-item UPDATE affected 0 rows — last_server mismatch or player already offline");
             return false;
         }
+        if (advancements != null) rememberWrittenAdvancements(s.uuid(), advancements);
         return true;
     }
 
@@ -2678,8 +3232,6 @@ public class VanillaSync {
     // All periodic tasks merged into a single ServerTickEvent handler.
     // FIX: Previously used LevelTickEvent which fires once per dimension, causing the tick counter
     // to increment 3x faster than expected (once per overworld, nether, end).
-    private static int heartbeatTickCounter = 0;
-    private static final int HEARTBEAT_INTERVAL_TICKS = 600; // Every 30 seconds (20 tps * 30s)
     private static int autoSaveTickCounter = 0;
     private static final int AUTO_SAVE_INTERVAL_TICKS = 6000; // Every 5 minutes (20 tps × 300s)
     // FIX PERF: Staggered auto-save. Instead of snapshotting ALL 35 players in one tick
@@ -2720,9 +3272,26 @@ public class VanillaSync {
         }
     }
 
+    /** Adds one player to the staggered save queue unless already queued. Main thread only. */
+    private static void enqueueForStaggeredSave(UUID uuid) {
+        if (!autoSaveQueue.contains(uuid)) autoSaveQueue.add(uuid);
+    }
+
+    /**
+     * {@code skip_saves_when_tps_below}: true when periodic saves should wait for the server
+     * to recover. Never applies to logout, shutdown, death or respawn saves.
+     */
+    private static boolean periodicSavesPaused(MinecraftServer server) {
+        int minTps = JdbcConfig.SKIP_SAVES_WHEN_TPS_BELOW.get();
+        if (minTps <= 0 || server == null) return false;
+        double msptLimit = 1000.0 / minTps;
+        return server.getAverageTickTimeNanos() / 1_000_000.0 > msptLimit;
+    }
+
+    private static long lastTpsSkipLog = 0L;
+
     @SubscribeEvent
     public static void onServerTick(ServerTickEvent.Post event) {
-        heartbeatTickCounter++;
         autoSaveTickCounter++;
 
         // PERF (A7): every 600 ticks (~30 s) drop any connectCheckCache entry older
@@ -2737,48 +3306,41 @@ public class VanillaSync {
             }
         }
 
-        // Heartbeat: update server_info to prove this server is alive
-        if (heartbeatTickCounter >= HEARTBEAT_INTERVAL_TICKS) {
-            heartbeatTickCounter = 0;
-            executorService.submit(() -> {
-                try {
-                    JDBCsetUp.executePreparedUpdate("UPDATE " + Tables.serverInfo() + " SET last_update=? WHERE id=?",
-                            System.currentTimeMillis(), JdbcConfig.SERVER_ID.get());
-                } catch (SQLException e) {
-                    PlayerSync.LOGGER.error("Error updating server heartbeat", e);
-                }
-            });
-        }
+        // 2.2.0: the tick-driven heartbeat is gone. HeartbeatService writes the same row
+        // on its own thread every heartbeat_interval_seconds (this one ignored that key).
 
         // Auto-save: snapshot ALL entity data on MAIN THREAD (fast, no I/O), then write
         // to DB on a BACKGROUND THREAD.
-        //
-        // FIX: Previously the background task called ModCompatSync.storeAll(player),
-        // storeSophisticatedBackpacks(player), etc. from off-thread — accessing entity
-        // state (inventory, Accessories API, CosmeticArmor, NeoForge attachments) in a
-        // non-thread-safe way.  All entity reads are now done in snapshotPlayerData()
-        // on the main thread, and the background task only does DB writes.
         //
         // FIX PERF: Staggered auto-save — saves ONE player per tick instead of ALL at once.
         // Old behavior: 35 players snapshotted in ONE tick → 770-3605ms MSPT spike every 5 min.
         // New behavior: queue refilled every 5 min, then drained 1 player/tick → 22-103ms/tick max.
         // Backpack contents are included (prevents data loss on hard crash).
+        // The vanilla autosave (SaveToFile) and PeriodicSaveService feed the same queue.
+        MinecraftServer srv = ServerLifecycleHooks.getCurrentServer();
         if (autoSaveTickCounter >= AUTO_SAVE_INTERVAL_TICKS) {
             autoSaveTickCounter = 0;
-            // Refill the queue with all eligible players
-            autoSaveQueue.clear();
-            MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
-            if (server != null) {
-                for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-                    autoSaveQueue.add(p.getUUID());
+            if (srv != null) {
+                for (ServerPlayer p : srv.getPlayerList().getPlayers()) {
+                    enqueueForStaggeredSave(p.getUUID());
                 }
             }
         }
 
         // Process ONE player from the queue per tick (staggered)
         if (!autoSaveQueue.isEmpty()) {
+            // 2.2.0: skip_saves_when_tps_below was documented but never read. The queue is
+            // kept, not dropped: the players are saved as soon as the server recovers.
+            if (periodicSavesPaused(srv)) {
+                long now = System.currentTimeMillis();
+                if (now - lastTpsSkipLog > 60_000L) {
+                    lastTpsSkipLog = now;
+                    PlayerSync.LOGGER.info("[auto-save] paused: average tick time above skip_saves_when_tps_below ({} players waiting)",
+                            autoSaveQueue.size());
+                }
+                return;
+            }
             UUID queued = autoSaveQueue.removeFirst();
-            MinecraftServer srv = ServerLifecycleHooks.getCurrentServer();
             ServerPlayer player = srv == null ? null : srv.getPlayerList().getPlayer(queued);
             String puuid = queued.toString();
 
@@ -2787,74 +3349,18 @@ public class VanillaSync {
             if (player != null
                     && !player.hasDisconnected() && !player.isDeadOrDying() && !syncNotCompletedPlayer.contains(puuid)
                     && !pendingLogoutSaves.containsKey(puuid) && player.getTags().contains("player_synced")) {
-                ReentrantLock lock = getPlayerLock(puuid);
-                if (lock.tryLock()) {
-                    try {
-                        // PHASE 18: freeze on main thread (fast copies), materialize on BG.
-                        final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
-                        // 2.1.6: Sophisticated Storage and RS2 disks join the auto-save. They
-                        // used to be persisted only at logout / shutdown, so a hard crash lost
-                        // everything a player had moved into a shulker or a disk since login.
-                        // Cost stays bounded: one player per tick, and skipUnchanged below
-                        // means untouched blobs are never rewritten.
-                        final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
-
-                        executorService.submit(() -> {
-                            // FIX P0-a/b/c (staggered auto-save BG): same triple guard as SaveToFile.
-                            if (pendingLogoutSaves.containsKey(puuid)) return;
-                            ReentrantLock bgLock = getPlayerLock(puuid);
-                            if (!bgLock.tryLock()) return;
-                            try {
-                                if (pendingLogoutSaves.containsKey(puuid)) return;
-                                try (JDBCsetUp.QueryResult oc = JDBCsetUp.executePreparedQuery(
-                                        "SELECT online FROM " + Tables.playerData() + " WHERE uuid=?", puuid)) {
-                                    ResultSet rs = oc.resultSet();
-                                    if (rs.next() && rs.getInt("online") == 0) {
-                                        SyncLogger.guardBlocked(puuid, JdbcConfig.SERVER_ID.get(),
-                                                "Staggered auto-save BG skipped — player offline in DB");
-                                        return;
-                                    }
-                                }
-                                // PHASE 18: heavy serialization on BG.
-                                PlayerDataSnapshot snapshot = frozen.materialize();
-                                // PHASE 7 PERF: hash-skip identical snapshots.
-                                int newHash = computeSnapshotHash(snapshot);
-                                Integer prev = lastWrittenSnapshotHash.get(puuid);
-                                if (prev != null && prev == newHash) {
-                                    // AUDIT FIX (dup/perf): the core hash does NOT cover
-                                    // backpack/SS blobs (SavedData keyed by item UUID).
-                                    // A player moving items INSIDE a backpack leaves the
-                                    // core hash unchanged — previously the early return
-                                    // dropped the changed blob until logout, widening the
-                                    // crash-loss window. Persist container-only changes;
-                                    // the per-UUID hash inside skipUnchanged=true keeps
-                                    // unchanged blobs from being rewritten.
-                                    ModsSupport.saveBackpackSnapshots(storageSnapshots, true);
-                                    return;
-                                }
-                                boolean persisted = writeSnapshotToDB(snapshot);
-                                if (persisted) {
-                                    lastWrittenSnapshotHash.put(puuid, newHash);
-                                    // AUDIT FIX (write amplification): skipUnchanged=true —
-                                    // health/xp churn changes the core hash on nearly every
-                                    // auto-save, but the container MEDIUMBLOBs are usually
-                                    // untouched; don't rewrite them unconditionally.
-                                    ModsSupport.saveBackpackSnapshots(storageSnapshots, true);
-                                } else {
-                                    PlayerSync.LOGGER.warn("Staggered auto-save: core write blocked for {}", puuid);
-                                    SyncLogger.saveSkipped(puuid, "AUTO", "core guard blocked");
-                                }
-                            } catch (Exception e) {
-                                PlayerSync.LOGGER.error("Error auto-saving player {}", puuid, e);
-                            } finally {
-                                bgLock.unlock();
-                            }
-                        });
-                    } catch (Exception e) {
-                        PlayerSync.LOGGER.error("Error snapshotting player {}", puuid, e);
-                    } finally {
-                        lock.unlock();
-                    }
+                try {
+                    // PHASE 18: freeze on main thread (fast copies), materialize on BG.
+                    final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
+                    // 2.1.6: Sophisticated Storage and RS2 disks join the auto-save. They
+                    // used to be persisted only at logout / shutdown, so a hard crash lost
+                    // everything a player had moved into a shulker or a disk since login.
+                    // Cost stays bounded: one player per tick, and unchanged blobs are
+                    // skipped by their per-UUID hash.
+                    final Map<UUID, CompoundTag> storageSnapshots = snapshotAllStorages(player);
+                    queuePeriodicWrite(puuid, joinSessions.get(puuid), frozen, storageSnapshots, "AUTO");
+                } catch (Exception e) {
+                    PlayerSync.LOGGER.error("Error snapshotting player {}", puuid, e);
                 }
             }
         }
@@ -2947,26 +3453,20 @@ public class VanillaSync {
             // skip the backpack / SS / RS2 main-thread snapshots that the logout-save
             // would normally produce. Saves CPU on the hot death path too.
             final DeferredPlayerSnapshot frozen = snapshotPlayerData(player);
+            final Object session = joinSessions.get(puuid);
 
             executorService.submit(() -> {
-                if (!playerLocks.containsKey(puuid)) return;
+                // 2.2.0: session check instead of playerLocks.containsKey (see queuePeriodicWrite).
+                if (!isJoinSessionCurrent(puuid, session)) return;
                 // FIX CRITICAL ANTI-DUP (P0-a): early skip if logout is already in flight.
                 if (pendingLogoutSaves.containsKey(puuid)) return;
                 ReentrantLock bgLock = getPlayerLock(puuid);
                 if (!bgLock.tryLock()) return;
                 try {
                     // FIX CRITICAL ANTI-DUP (P0-b): re-check under lock.
-                    if (pendingLogoutSaves.containsKey(puuid)) return;
-                    // FIX CRITICAL ANTI-DUP (P0-c): skip if logout has already committed.
-                    try (JDBCsetUp.QueryResult onlineCheck = JDBCsetUp.executePreparedQuery(
-                            "SELECT online FROM " + Tables.playerData() + " WHERE uuid=?", puuid)) {
-                        ResultSet rs = onlineCheck.resultSet();
-                        if (rs.next() && rs.getInt("online") == 0) {
-                            SyncLogger.guardBlocked(puuid, JdbcConfig.SERVER_ID.get(),
-                                    "Death-save BG skipped — player already offline in DB");
-                            return;
-                        }
-                    }
+                    if (pendingLogoutSaves.containsKey(puuid) || !isJoinSessionCurrent(puuid, session)) return;
+                    // FIX CRITICAL ANTI-DUP (P0-c): a committed logout (online=0) is now
+                    // enforced inside writeNonItemSnapshotToDB's UPDATE itself.
                     long t0 = System.currentTimeMillis();
                     // PHASE 18: materialize the frozen snapshot on BG.
                     PlayerDataSnapshot snapshot = frozen.materialize();

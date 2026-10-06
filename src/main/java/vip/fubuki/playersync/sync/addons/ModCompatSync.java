@@ -117,7 +117,21 @@ public class ModCompatSync {
      *         the writer preserves the existing record instead of wiping it
      */
     public static String snapshotAccessories(Player player) {
+        return serializeSlots(captureAccessories(player));
+    }
+
+    /**
+     * Main-thread half of the Accessories snapshot: frozen copies of the occupied slots,
+     * serialized later on the writer thread ({@link #serializeSlots}).
+     *
+     * @return the slots, or {@code null} when nothing must be written: capability
+     *         unavailable, or {@code sync_accessories} off on this server (2.2.0: the toggle
+     *         used to gate the restore only, so a server with it off kept publishing slots it
+     *         never read back, and its stale copy overwrote everyone else's)
+     */
+    public static Map<String, ItemStack> captureAccessories(Player player) {
         if (!ModList.get().isLoaded("accessories")) return null;
+        if (!JdbcConfig.SYNC_ACCESSORIES.get()) return null;
         try {
             io.wispforest.accessories.api.AccessoriesCapability cap =
                     io.wispforest.accessories.api.AccessoriesCapability.get(player);
@@ -127,24 +141,37 @@ public class ModCompatSync {
                         "capability unavailable — skipping write to preserve DB");
                 return null;
             }
-            Map<String, String> flatMap = new HashMap<>();
+            Map<String, ItemStack> slots = new HashMap<>();
             for (Map.Entry<String, io.wispforest.accessories.api.AccessoriesContainer> entry : cap.getContainers().entrySet()) {
                 String slotType = entry.getKey();
                 var accessories = entry.getValue().getAccessories();
                 for (int i = 0; i < accessories.getContainerSize(); i++) {
                     ItemStack stack = accessories.getItem(i);
                     if (!stack.isEmpty()) {
-                        flatMap.put(slotType + ":" + i, VanillaSync.getNbtForStorage(stack));
+                        slots.put(slotType + ":" + i, stack.copy());
                     }
                 }
             }
-            // Capability read OK — "{}" is intentional for truly empty slots so the apply
-            // side clears stale .dat contents.
-            return flatMap.toString();
+            // Capability read OK — an empty map is intentional for truly empty slots so the
+            // apply side clears stale .dat contents.
+            return slots;
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Error snapshotting Accessories for player {}", player.getUUID(), e);
             return null;
         }
+    }
+
+    /**
+     * Serializes captured slots to the stored map format. Safe on the writer thread: the
+     * stacks are copies taken on the main thread.
+     */
+    public static <K> String serializeSlots(Map<K, ItemStack> slots) {
+        if (slots == null) return null;
+        Map<K, String> flatMap = new HashMap<>();
+        for (Map.Entry<K, ItemStack> entry : slots.entrySet()) {
+            flatMap.put(entry.getKey(), VanillaSync.getNbtForStorage(entry.getValue()));
+        }
+        return flatMap.toString();
     }
 
     // ============================
@@ -200,19 +227,28 @@ public class ModCompatSync {
      *         unavailable so the writer preserves the existing record
      */
     public static String snapshotCosmeticArmor(Player player) {
+        return serializeSlots(captureCosmeticArmor(player));
+    }
+
+    /**
+     * Main-thread half of the Cosmetic Armor snapshot. {@code null} also when
+     * {@code sync_cosmetic_armor} is off here (2.2.0: symmetric toggle, see captureAccessories).
+     */
+    public static Map<Integer, ItemStack> captureCosmeticArmor(Player player) {
         if (!ModList.get().isLoaded("cosmeticarmorreworked")) return null;
+        if (!JdbcConfig.SYNC_COSMETIC_ARMOR.get()) return null;
         try {
             lain.mods.cos.impl.inventory.InventoryCosArmor cosInv =
                     lain.mods.cos.impl.ModObjects.invMan.getCosArmorInventory(player.getUUID());
             if (cosInv == null) return null;
-            Map<Integer, String> flatMap = new HashMap<>();
+            Map<Integer, ItemStack> slots = new HashMap<>();
             for (int i = 0; i < cosInv.getContainerSize(); i++) {
                 ItemStack stack = cosInv.getItem(i);
                 if (!stack.isEmpty()) {
-                    flatMap.put(i, VanillaSync.getNbtForStorage(stack));
+                    slots.put(i, stack.copy());
                 }
             }
-            return flatMap.toString();
+            return slots;
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Error snapshotting CosmeticArmor for player {}", player.getUUID(), e);
             return null;
@@ -228,37 +264,75 @@ public class ModCompatSync {
      * Returns a BNBT-serialized string, or null when there is nothing to store.
      */
     public static String snapshotAttachments(Player player) {
+        return serializeTag(captureAttachments(player));
+    }
+
+    /**
+     * Main-thread half of the attachment snapshot: a detached copy of the player's
+     * serialized attachments, minus {@code attachment_blacklist}. Serialized later on the
+     * writer thread. Attachments are saved whatever {@code sync_attachments} says, so the
+     * stored copy is current the day an admin turns the restore on.
+     */
+    public static CompoundTag captureAttachments(Player player) {
         if (SERIALIZE_ATTACHMENTS == null) return null;
         try {
             if (!(player instanceof net.minecraft.server.level.ServerPlayer serverPlayer)) return null;
             CompoundTag attachments = (CompoundTag)
                     SERIALIZE_ATTACHMENTS.invoke(player, serverPlayer.getServer().registryAccess());
             if (attachments == null || attachments.isEmpty()) return null;
-            return VanillaSync.serializeTagToBinaryBase64(attachments);
+            // A serializer may hand back a mod's live internal tag: detach it before the
+            // writer thread reads it.
+            CompoundTag copy = attachments.copy();
+            removeBlacklistedAttachments(copy);
+            return copy.isEmpty() ? null : copy;
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Error snapshotting NeoForge attachments for player {}", player.getUUID(), e);
             return null;
         }
     }
 
+    private static void removeBlacklistedAttachments(CompoundTag attachments) {
+        try {
+            java.util.List<?> blacklist = JdbcConfig.ATTACHMENT_BLACKLIST.get();
+            if (blacklist == null) return;
+            for (Object id : blacklist) {
+                if (id != null) attachments.remove(id.toString());
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** BNBT-serializes a captured tag. Writer thread. */
+    public static String serializeTag(CompoundTag tag) {
+        if (tag == null || tag.isEmpty()) return null;
+        return VanillaSync.serializeTagToBinaryBase64(tag);
+    }
+
     /**
      * Applies pre-read NeoForge attachment data to the player entity (NO DB access).
      * Goes through NeoForge's own deserialization so the result is identical to a normal
      * player load.
+     *
+     * <p>2.2.0: {@code deserializeAttachments} reads each top-level key as an attachment id.
+     * The data used to be wrapped under {@code "neoforge:attachments"} first (the key
+     * {@code Entity#load} strips before the same call), so NeoForge saw one unknown
+     * attachment, logged "unknown or non-serializable data attachment" and applied nothing:
+     * attachments never crossed servers. Fixed, and gated behind {@code sync_attachments}
+     * because enabling it changes what players get back. Blacklisted ids are dropped here as
+     * well, which also covers rows saved before the blacklist existed.
      */
     public static void applyAttachmentsFromData(Player player, String serialized) {
+        if (!JdbcConfig.SYNC_ATTACHMENTS.get()) return;
         if (serialized == null || !serialized.startsWith("BNBT:")) return;
         if (DESERIALIZE_ATTACHMENTS == null) return;
         try {
             if (!(player instanceof net.minecraft.server.level.ServerPlayer serverPlayer)) return;
 
             CompoundTag attachments = VanillaSync.deserializeBinaryBase64Tag(serialized);
+            removeBlacklistedAttachments(attachments);
             if (attachments.isEmpty()) return;
 
-            CompoundTag wrapper = new CompoundTag();
-            wrapper.put("neoforge:attachments", attachments);
-
-            DESERIALIZE_ATTACHMENTS.invoke(player, serverPlayer.getServer().registryAccess(), wrapper);
+            DESERIALIZE_ATTACHMENTS.invoke(player, serverPlayer.getServer().registryAccess(), attachments);
 
             PlayerSync.LOGGER.debug("Applied NeoForge attachments for player {} ({} keys)",
                     player.getUUID(), attachments.getAllKeys().size());
@@ -286,13 +360,20 @@ public class ModCompatSync {
      *         feature is disabled
      */
     public static String snapshotPersistentData(Player player) {
+        return serializeTag(capturePersistentData(player));
+    }
+
+    /**
+     * Main-thread half of the persistent-data snapshot: the filtered copy, serialized later
+     * on the writer thread ({@link #serializeTag}).
+     */
+    public static CompoundTag capturePersistentData(Player player) {
         if (!JdbcConfig.SYNC_PERSISTENT_DATA.get()) return null;
         try {
             CompoundTag persistent = player.getPersistentData();
             if (persistent == null || persistent.isEmpty()) return null;
-            CompoundTag filtered = filterPersistentData(persistent);
-            if (filtered.isEmpty()) return null;
-            return VanillaSync.serializeTagToBinaryBase64(filtered);
+            CompoundTag filtered = filterPersistentData(persistent); // already a deep copy
+            return filtered.isEmpty() ? null : filtered;
         } catch (Exception e) {
             PlayerSync.LOGGER.error("Error snapshotting persistent data for player {}", player.getUUID(), e);
             return null;

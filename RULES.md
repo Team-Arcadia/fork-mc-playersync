@@ -9,7 +9,7 @@ Single source of truth for anyone (human or tooling) working on this repository.
 | Project      | PlayerSync (Team Arcadia fork)                                     |
 | Mod ID       | `playersync`                                                       |
 | Package      | `vip.fubuki.playersync`                                            |
-| Version      | 2.1.8 (VERSION LOCKED — see §3)                                    |
+| Version      | 2.2.0 (VERSION LOCKED — see §3)                                    |
 | Tech stack   | Java 21, NeoForge 21.1.x (Minecraft 1.21.1), Gradle (ModDevGradle) |
 | Storage      | MySQL / MariaDB via HikariCP                                       |
 | Authors      | mlus (upstream), Team Arcadia / vyrriox (fork maintenance)         |
@@ -36,6 +36,10 @@ Single source of truth for anyone (human or tooling) working on this repository.
   - Any item-clearing DB logic MUST check the `keepInventory` game rule.
   - Never write an "empty" state to DB when the source is uncertain (absent capability ≠ empty data).
   - Always clear-before-restore for stores that merge instead of replace (BackpackStorage, SS contents).
+  - A background task that outlives a tick must carry the login session it works for (`joinSessions` token) and re-check it before any visible write; the uuid alone cannot tell a departed or new session apart.
+  - Never write `online` without `AND last_server=?`. Periodic writes (core row, curios, mod data, containers) also require `online=1` inside the SQL itself.
+  - `player_synced` is stripped at login and means "restored in THIS session"; a session without it never writes.
+  - Calling a NeoForge/MC method reflectively: read its body, not just its signature (attachments wrapper bug, ERROR_LOG 2026-10-06). Before relying on an event, check that the loader actually posts it.
 
 ## 4. Project Structure
 
@@ -45,7 +49,8 @@ src/main/java/vip/fubuki/playersync/
 ├── CommandInit.java         # /playersync admin commands (DB bodies run async on the executor)
 ├── config/JdbcConfig.java   # All config keys (general / save_triggers / sync_toggles / performance / safety / observability)
 ├── sync/
-│   ├── VanillaSync.java     # CORE: join/logout/death/save pipeline, executor, guards, snapshots
+│   ├── VanillaSync.java     # CORE: join/logout/death/save pipeline, executors, guards, snapshots
+│   ├── SyncPendingGuard.java # Freezes interactions while a restore is pending (pre-restore dup window)
 │   └── addons/
 │       ├── ModsSupport.java     # Curios + Sophisticated Backpacks/Storage + RS2 save/restore
 │       ├── ModCompatSync.java   # Accessories / CosmeticArmor / NeoForge attachments
@@ -81,7 +86,10 @@ CHANGELOG.md                 # Bilingual, strict template, most recent on top
 - [ ] Death with corpse mod + disconnect from ReviveMe fallen state (`dieOnDisconnect` both true and false) — no dup, no loss (r1-r7)
 - [ ] `keepInventory=true` death + disconnect — items preserved
 - [ ] Cross-server transfer: backpack / curios / accessories / attachments follow, no dup
-- [ ] `kill -9` the server — `CrashRecovery` flushes; rejoin on peer works without 60s wait
+- [ ] Stop the server with SIGTERM / Ctrl+C — the graceful save runs once, the emergency flush stays idle
+- [ ] `kill -9` the server — no hook runs; at next boot `CrashRecovery` clears the orphan flags; rejoin on a peer works once the heartbeat is stale
+- [ ] Join, then disconnect while the join is still waiting for the previous server — no stuck `online=1`, rejoin works anywhere
+- [ ] During a slow join (peer still saving) the player cannot toss, pick up, open containers or take damage
 - [ ] `/playersync status|info|inventory|orphans` respond without tick stall on a slow DB
 - [ ] Non-op in a command block CANNOT run `wipe`/`peerkill`/`cleanup`/`clearorphans`/`resync`
 - [ ] sync.log rotates past the configured size
@@ -101,7 +109,7 @@ docker compose up -d              # MariaDB + Adminer (localhost:3306 / :8080)
 
 1. Read `ERROR_LOG.md` and this file before any change; its prevention rules override default instincts.
 2. Respect the version lock (§3) and the bilingual CHANGELOG template.
-3. Never weaken an anti-duplication guard (`last_server` CAS, `pendingLogoutSaves`, `bgLock`, online-flag check, hash-skip invalidation, fallen-state detection) without proving every interleaving safe in BOTH handler orders.
+3. Never weaken an anti-duplication guard (`last_server` CAS, `pendingLogoutSaves`, `bgLock`, online-flag check, session token, hash-skip invalidation, fallen-state detection, `SyncPendingGuard`) without proving every interleaving safe in BOTH handler orders.
 4. Keep the threading model intact: no JDBC on the main thread, no entity access off it.
 5. Destructive operations (force-push, mass deletion, DB schema drops) require explicit human confirmation.
 6. When fixing mod-interaction bugs, decompile the other mod's actual handlers (`javap -p -c`) instead of guessing its event semantics.

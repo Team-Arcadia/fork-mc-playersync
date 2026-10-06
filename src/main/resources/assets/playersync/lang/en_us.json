@@ -3,5 +3,8 @@
   "playersync.item_placeholder_title": "Item Voucher",
   "playersync.already_online": "You can't join more than one synchronization server at the same time.",
   "playersync.sqlexception": "SqlException detected!Connection lost,please contact with your admin.",
-  "playersync.wrong_entity_status": "An error occurred while creating playerEntity in the world,please login again."
+  "playersync.wrong_entity_status": "An error occurred while creating playerEntity in the world,please login again.",
+  "playersync.claim_lost": "PlayerSync: another server is finalizing your save. Please reconnect in a few seconds.",
+  "playersync.sync_failed": "PlayerSync could not load your data. Nothing was lost, please reconnect.",
+  "playersync.sync_pending": "Loading your data, please wait..."
 }

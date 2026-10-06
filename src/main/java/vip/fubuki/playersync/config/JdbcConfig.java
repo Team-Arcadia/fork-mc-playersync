@@ -53,6 +53,8 @@ public class JdbcConfig {
     public static ModConfigSpec.BooleanValue SYNC_REFINED_STORAGE;
     public static ModConfigSpec.BooleanValue SYNC_PERSISTENT_DATA;
     public static ModConfigSpec.ConfigValue<List<String>> PERSISTENT_DATA_BLACKLIST;
+    public static ModConfigSpec.BooleanValue SYNC_ATTACHMENTS;
+    public static ModConfigSpec.ConfigValue<List<String>> ATTACHMENT_BLACKLIST;
 
     // ----- Performance tuning (new section) -----
     public static ModConfigSpec.IntValue HEARTBEAT_INTERVAL_SECONDS;
@@ -166,7 +168,7 @@ public class JdbcConfig {
                 "separately, but many mods still write here. Corail Tombstone stores knowledge,",
                 "alignment, perks and watcher knowledge in it, so leaving this off means Tombstone",
                 "progression resets on every server change.",
-                "Use persistent_data_blacklist below to exclude individual top-level keys.")
+                "Use persistent_data_blacklist below to exclude individual keys.")
                 .define("sync_persistent_data", true);
         PERSISTENT_DATA_BLACKLIST = B.comment(
                 "Top-level keys of the persistent-data tag that must NOT be synchronized.",
@@ -176,6 +178,23 @@ public class JdbcConfig {
                 "(known waystones only exist in the world that created them).",
                 "Example: [\"mymod_home_pos\", \"mymod_last_death\"]")
                 .define("persistent_data_blacklist", new ArrayList<>());
+        SYNC_ATTACHMENTS = B.comment(
+                "Apply the player's NeoForge data attachments (the modern per-player storage of",
+                "Ars Nouveau, Iron's Spells, Apotheosis, The Aether, Pehkui...) from the database",
+                "on join. They are always saved; this only controls whether they are restored.",
+                "Before 2.2.0 the restore silently did nothing (the data was wrapped in an extra",
+                "key NeoForge does not read), so turning this on changes what players get back",
+                "when they switch server: try it on a test server first.",
+                "Use attachment_blacklist below for attachments that are world-bound or that carry",
+                "items already synced through their own channel.")
+                .define("sync_attachments", false);
+        ATTACHMENT_BLACKLIST = B.comment(
+                "Attachment ids (namespace:path) that are never saved nor restored by the",
+                "attachment sync. The defaults hold items synced elsewhere (Curios, Accessories)",
+                "or a transient state (Revive Me's downed state): syncing them twice would",
+                "duplicate items, notably with a corpse.")
+                .define("attachment_blacklist", new ArrayList<>(List.of(
+                        "curios:inventory", "accessories:inventory_holder", "revive_me:fallen_data")));
         B.pop();
 
         // ===== [performance] =====

@@ -394,6 +394,80 @@ public class ModsSupport {
         }
     }
 
+    /**
+     * Container blobs prepared for a write that is guarded by the player's {@code last_server}
+     * and runs inside the same transaction as the player's core row.
+     *
+     * <p>2.2.0: container contents used to be committed in their own unguarded transaction
+     * AFTER the core row. On logout the core row already said {@code online=0}, so a peer
+     * could claim the player in between, read the previous container contents and keep the
+     * items the player had just taken out of them: duplication. Written in the same commit,
+     * a peer sees either both or neither.
+     */
+    public static final class StorageWrite {
+        private final List<Object[]> statements = new ArrayList<>();
+        private final List<UUID> uuids = new ArrayList<>();
+        private final List<Integer> hashes = new ArrayList<>();
+
+        public boolean isEmpty() { return statements.isEmpty(); }
+        public int size() { return statements.size(); }
+        public List<Object[]> statements() { return statements; }
+
+        /** Records the written hashes once the enclosing transaction has committed. */
+        public void markCommitted() {
+            for (int i = 0; i < uuids.size(); i++) {
+                lastWrittenStorageHash.put(uuids.get(i), hashes.get(i));
+            }
+        }
+
+        /** Same as {@link #markCommitted} for the statement at {@code index} only. */
+        public void markCommitted(int index) {
+            lastWrittenStorageHash.put(uuids.get(index), hashes.get(index));
+        }
+    }
+
+    /**
+     * @param requireOnline also require {@code online=1}. Needed when the write runs alone
+     *                      (an auto-save), not when it follows the logout's own core UPDATE
+     *                      in the same transaction, which has just set {@code online=0}.
+     */
+    public static StorageWrite prepareStorageWrite(Map<UUID, CompoundTag> snapshots, boolean skipUnchanged,
+                                                   String playerUuid, int serverId, boolean requireOnline) {
+        StorageWrite write = new StorageWrite();
+        if (snapshots == null || snapshots.isEmpty()) return write;
+        String sql = "INSERT INTO " + Tables.backpackData() + " (uuid, backpack_nbt) SELECT ?, ? FROM "
+                + Tables.playerData() + " WHERE uuid=? AND last_server=?" + (requireOnline ? " AND online=1" : "")
+                + " ON DUPLICATE KEY UPDATE backpack_nbt=VALUES(backpack_nbt)";
+        int unchangedSkips = 0;
+        for (Map.Entry<UUID, CompoundTag> entry : snapshots.entrySet()) {
+            UUID uuid = entry.getKey();
+            CompoundTag nbt = entry.getValue();
+            if (nbt == null) continue;
+            // An EMPTY tag is written on purpose: it is the tombstone that tells the next
+            // restore "this container is empty" (#238). See saveBackpackSnapshots.
+            try {
+                String serialized = VanillaSync.serializeTagToBinaryBase64(nbt);
+                int h = serialized.hashCode();
+                if (skipUnchanged) {
+                    Integer prev = lastWrittenStorageHash.get(uuid);
+                    if (prev != null && prev == h) {
+                        unchangedSkips++;
+                        continue;
+                    }
+                }
+                write.statements.add(new Object[]{sql, uuid.toString(), serialized, playerUuid, serverId});
+                write.uuids.add(uuid);
+                write.hashes.add(h);
+            } catch (Exception e) {
+                PlayerSync.LOGGER.error("Error preparing storage save for UUID {}", uuid, e);
+            }
+        }
+        if (unchangedSkips > 0) {
+            PlayerSync.LOGGER.debug("[save-storage] skipped {} unchanged blobs (per-UUID hash)", unchangedSkips);
+        }
+        return write;
+    }
+
     /** Sophisticated Storage shares the {@code backpack_data} table and the same writer. */
     public static void saveSSSnapshots(Map<UUID, CompoundTag> snapshots) {
         saveBackpackSnapshots(snapshots);
@@ -623,7 +697,18 @@ public class ModsSupport {
      * preserves whatever is already stored rather than wiping a real record.
      */
     public static String snapshotCuriosData(Player player) {
+        return ModCompatSync.serializeSlots(captureCurios(player));
+    }
+
+    /**
+     * Main-thread half of the Curios snapshot: frozen copies of the occupied slots,
+     * serialized on the writer thread. {@code null} means "do not write": handler
+     * unavailable, or {@code sync_curios} off on this server (2.2.0: the toggle used to gate
+     * the restore only, so a server with it off kept publishing curios it never read back).
+     */
+    public static Map<String, ItemStack> captureCurios(Player player) {
         if (!ModList.get().isLoaded("curios")) return null;
+        if (!vip.fubuki.playersync.config.JdbcConfig.SYNC_CURIOS.get()) return null;
         Optional<ICuriosItemHandler> handlerOpt = CuriosApi.getCuriosInventory(player);
         // If the handler could not be resolved (capability not yet attached, or a Curios
         // issue), return null so the writer SKIPS the write and preserves the DB. Returning
@@ -632,7 +717,7 @@ public class ModsSupport {
             PlayerSync.LOGGER.warn("Curios handler unavailable while snapshotting {} — skipping curios write", player.getUUID());
             return null;
         }
-        Map<String, String> flatMap = new HashMap<>();
+        Map<String, ItemStack> slots = new HashMap<>();
         ICuriosItemHandler handler = handlerOpt.get();
         // BOTH functional and cosmetic stacks are captured. Cosmetic slots are identified by
         // the "cos:" prefix in the composite key so apply/clear can tell them apart without
@@ -642,18 +727,18 @@ public class ModsSupport {
             for (int i = 0; i < dynStacks.getSlots(); i++) {
                 ItemStack stack = dynStacks.getStackInSlot(i);
                 if (!stack.isEmpty()) {
-                    flatMap.put(slotType + ":" + i, VanillaSync.getNbtForStorage(stack));
+                    slots.put(slotType + ":" + i, stack.copy());
                 }
             }
             IDynamicStackHandler cosStacks = stacksHandler.getCosmeticStacks();
             for (int i = 0; i < cosStacks.getSlots(); i++) {
                 ItemStack stack = cosStacks.getStackInSlot(i);
                 if (!stack.isEmpty()) {
-                    flatMap.put("cos:" + slotType + ":" + i, VanillaSync.getNbtForStorage(stack));
+                    slots.put("cos:" + slotType + ":" + i, stack.copy());
                 }
             }
         });
-        return flatMap.toString();
+        return slots;
     }
 
     /** Applies pre-read curios data to the player entity (NO DB access). */

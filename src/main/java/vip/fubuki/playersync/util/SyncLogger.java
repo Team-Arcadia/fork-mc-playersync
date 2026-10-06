@@ -227,15 +227,51 @@ public class SyncLogger {
                 return;
             }
             String formatted = formatMessage(message, args);
-            String line = String.format("[%s] [%s] [%s] %s",
-                    LocalDateTime.now().format(TIME_FMT),
-                    Thread.currentThread().getName(),
-                    level,
-                    formatted);
+            String line = structuredJson()
+                    // 2.2.0: log_structured_json was documented but never read.
+                    ? "{\"time\":\"" + jsonEscape(LocalDateTime.now().format(TIME_FMT))
+                            + "\",\"thread\":\"" + jsonEscape(Thread.currentThread().getName())
+                            + "\",\"level\":\"" + jsonEscape(level)
+                            + "\",\"server_id\":" + JdbcConfig.SERVER_ID.get()
+                            + ",\"message\":\"" + jsonEscape(formatted) + "\"}"
+                    : String.format("[%s] [%s] [%s] %s",
+                            LocalDateTime.now().format(TIME_FMT),
+                            Thread.currentThread().getName(),
+                            level,
+                            formatted);
             writeQueue.add(line);
             queuedLines.incrementAndGet();
             // FIX PERF (C3): no inline flush — background scheduler drains the queue.
         } catch (Exception ignored) {}
+    }
+
+    private static boolean structuredJson() {
+        try {
+            return JdbcConfig.LOG_STRUCTURED_JSON.get();
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** Minimal JSON string escaping: quotes, backslashes and control characters. */
+    private static String jsonEscape(String s) {
+        if (s == null) return "";
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '"' -> sb.append("\\\"");
+                case '\\' -> sb.append("\\\\");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+                }
+            }
+        }
+        return sb.toString();
     }
 
     private static String formatMessage(String template, Object... args) {
@@ -280,11 +316,14 @@ public class SyncLogger {
             String line;
             int count = 0;
             while (count < DRAIN_BATCH && (line = writeQueue.poll()) != null) {
+                // 2.2.0: account for the line as soon as it leaves the queue. Decrementing
+                // after the batch skipped the decrement when a write threw, so the counter
+                // drifted up to the ceiling and the logger then dropped everything.
+                queuedLines.decrementAndGet();
+                count++;
                 writer.write(line);
                 writer.newLine();
-                count++;
             }
-            if (count > 0) queuedLines.addAndGet(-count);
             long dropped = droppedLines.getAndSet(0);
             if (dropped > 0) {
                 writer.write("[" + LocalDateTime.now().format(TIME_FMT) + "] [PlayerSync-logflush] [WARN] "

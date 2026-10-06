@@ -93,14 +93,16 @@ public final class ModCompatRegistry {
             new Entry("revive_me", "Revive Me", Mechanism.DEATH_INTEROP,
                     null, null,
                     "a fallen player keeps their .dat inventory: the DB apply is skipped on join and the item columns are cleared on logout"),
-            new Entry("arsnouveau", "Ars Nouveau", Mechanism.ATTACHMENTS,
-                    null, null, "mana and glyph knowledge"),
+            // 2.2.0: the attachment rows now name the toggle that actually governs them
+            // (sync_attachments) and Ars Nouveau's real mod id (ars_nouveau, not arsnouveau).
+            new Entry("ars_nouveau", "Ars Nouveau", Mechanism.ATTACHMENTS,
+                    "sync_attachments", () -> JdbcConfig.SYNC_ATTACHMENTS.get(), "mana and glyph knowledge"),
             new Entry("irons_spellbooks", "Iron's Spells 'n Spellbooks", Mechanism.ATTACHMENTS,
-                    null, null, "mana and learned spells"),
+                    "sync_attachments", () -> JdbcConfig.SYNC_ATTACHMENTS.get(), "mana and learned spells"),
             new Entry("pehkui", "Pehkui", Mechanism.ATTACHMENTS,
-                    null, null, "player scale"),
+                    "sync_attachments", () -> JdbcConfig.SYNC_ATTACHMENTS.get(), "player scale"),
             new Entry("solonion", "Spice of Life: Onion", Mechanism.ATTACHMENTS,
-                    null, null, "food diversity history")
+                    "sync_attachments", () -> JdbcConfig.SYNC_ATTACHMENTS.get(), "food diversity history")
     );
 
     public static List<Entry> entries() {

@@ -380,7 +380,10 @@ public class CommandInit {
     private static int runResync(com.mojang.brigadier.context.CommandContext<CommandSourceStack> ctx)
             throws CommandSyntaxException {
         ServerPlayer p = EntityArgument.getPlayer(ctx, "target");
-        p.removeTag("player_synced");
+        // 2.2.0: the tag is no longer removed here. A session without "player_synced" is
+        // now treated as never restored and its logout writes nothing, which would turn this
+        // command into "discard everything since the last auto-save". Kicking keeps the
+        // historical behaviour: logout save, then a full restore on rejoin.
         ctx.getSource().sendSuccess(() -> Component.literal("§eKicking §f" + p.getName().getString()
                 + " §eto force resync on rejoin"), true);
         SyncLogger.playerEvent(p.getUUID().toString(), "ADMIN_RESYNC", "Triggered by " + ctx.getSource().getTextName());

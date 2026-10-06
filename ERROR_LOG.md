@@ -4,6 +4,36 @@ Journal des erreurs rencontrées et corrigées. Chaque entrée documente un bug,
 
 ---
 
+## [2026-10-06] — NeoForge attachments never restored (wrapper key)
+**Context:** 2.2.0 compatibility audit against the production mod jars.
+**Error:** every join logged `Encountered unknown or non-serializable data attachment neoforge:attachments. Skipping.`; Ars Nouveau, Iron's Spells, Apotheosis, Aether attachments never crossed servers although they were saved.
+**Root cause:** `AttachmentHolder.deserializeAttachments` reads each top-level key as an attachment id. PlayerSync wrapped the data under `"neoforge:attachments"` (the key `Entity#load` strips before that same call), so NeoForge saw one unknown id.
+**Fix:** pass the attachment compound directly. Gated behind the new `sync_attachments` (default false) because enabling it changes what players get back; `attachment_blacklist` drops `curios:inventory`, `accessories:inventory_holder` and `revive_me:fallen_data`, which would otherwise duplicate Curios/Accessories items (notably with a corpse) once the restore works.
+**Prevention:** when calling a NeoForge/MC method reflectively, read its body (`javap -c` or the sources jar), not just its signature, and check the log for the "Skipping" line it prints on bad input. A feature that "works" must be verified end to end on a second server.
+
+## [2026-10-06] — PlayerNegotiationEvent is never posted on NeoForge 21.1
+**Context:** 2.2.0 performance audit.
+**Error:** `doPlayerConnect` never ran, its cache was always empty, and `onPlayerLoggedInKickCheck` ran one to three blocking JDBC queries on the main thread for every login.
+**Root cause:** the event class still exists in NeoForge 21.1.137 but nothing constructs it (grep of the merged sources).
+**Fix:** the already-online check runs on the join thread (`checkAlreadyOnlineElsewhere`), with `kick_grace_period_ms` and logout-in-progress awareness.
+**Prevention:** before relying on an event, grep the loader sources for `new <Event>(` / `post(new <Event>`; a class that compiles is not proof the event fires.
+
+## [2026-10-06] — Join task kept acting for a player who had left
+**Context:** 2.2.0 anti-duplication audit.
+**Error:** a player leaving while the join polled the previous server got claimed anyway (`online=1, last_server=self` for nobody) and was then refused everywhere as "already online"; the logout's unguarded `online=0` could also clear another server's flag and silence its auto-saves.
+**Root cause:** the join task only knew the uuid, which cannot tell "still here", "gone" and "gone and back as a new session" apart; the offline writes had no `last_server` guard.
+**Fix:** per-login session token (`joinSessions`) checked in the poll, after the claim (claim released if gone) and before the apply; `markOfflineIfOwned` guards every offline-only write.
+**Prevention:** any background task that outlives a tick must carry the session it works for and re-check it before each externally visible write. Never write `online` without `AND last_server=?`.
+
+## [2026-10-06] — Bash heredoc rejected a Python patch script
+**Context:** applying multi-line Java edits through `python - <<'EOF'` in the Bash tool.
+**Error:** `unexpected EOF while looking for matching ''` although the heredoc delimiter was quoted.
+**Root cause:** the tool's command wrapper mis-parses some quote/apostrophe combinations inside long heredocs.
+**Fix:** write the patch script to the scratchpad with the Write tool and run `python <file>`.
+**Prevention:** for multi-line patches, never inline the script in a heredoc; use a script file.
+
+---
+
 ## [2026-08-04] — #238 : duplication de backpack, `getOrCreate` rend « vide » et « inconnu » indiscernables
 
 **Context** : Bug #238 signalé par Darkdiamons. Backpack posé sur une chute avec un coffre en dessous, contenu transféré dans le coffre, backpack repris avant déconnexion → à la reconnexion, le stuff existait dans le coffre ET de nouveau dans le backpack.
