@@ -48,15 +48,30 @@ public final class SyncPendingGuard {
                 "Loading your data, please wait..."), true);
     }
 
+    /** True while {@link #onToss} hands a stack back, see the comment there. */
+    private static final ThreadLocal<Boolean> HANDING_BACK = ThreadLocal.withInitial(() -> false);
+
     @SubscribeEvent(priority = EventPriority.HIGHEST)
     public static void onToss(ItemTossEvent event) {
         Player player = event.getPlayer();
         if (!isPending(player)) return;
+        // placeItemBackInInventory drops what no longer fits with Player.drop, which fires this
+        // event again: with a full inventory the guard handed the stack back forever and the
+        // server died of a StackOverflowError (Server1, 2026-10-14). That overflow drop is let
+        // through, so the item lands on the ground instead of being lost.
+        if (HANDING_BACK.get()) return;
         // The stack has already left the inventory when this fires; canceling only stops
         // the item entity from spawning, so hand the stack back.
         ItemStack stack = event.getEntity().getItem();
         event.setCanceled(true);
-        if (!stack.isEmpty()) player.getInventory().placeItemBackInInventory(stack);
+        if (!stack.isEmpty()) {
+            HANDING_BACK.set(true);
+            try {
+                player.getInventory().placeItemBackInInventory(stack);
+            } finally {
+                HANDING_BACK.set(false);
+            }
+        }
         notifyPending(player);
     }
 

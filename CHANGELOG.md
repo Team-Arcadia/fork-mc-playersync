@@ -4,6 +4,18 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
+## [2.2.1] - 2026-10-14 (toss guard crash fix)
+
+### Fixed
+
+- **Server crash when a pending player could not take a tossed item back** - while a restore is pending, `SyncPendingGuard` cancels a toss and hands the stack back with `placeItemBackInInventory`. With a full inventory that method drops the item again, which fired the toss event again, forever: Server1 died of a `StackOverflowError` on 2026-10-14, seven seconds after a player logged in. The drop made while handing a stack back now goes through, so the item lands on the ground instead of looping or being lost.
+
+### Correctifs
+
+- **Crash serveur quand un joueur en attente ne pouvait pas reprendre un objet jeté** - pendant qu'une restauration est en attente, `SyncPendingGuard` annule le jet et rend l'objet avec `placeItemBackInInventory`. Avec un inventaire plein, cette méthode rejette l'objet, ce qui relançait l'événement de jet, sans fin : Server1 est tombé sur une `StackOverflowError` le 2026-10-14, sept secondes après la connexion d'un joueur. Le jet fait pendant la remise passe désormais, l'objet tombe au sol au lieu de boucler ou d'être perdu.
+
+---
+
 ## [2.2.0] - 2026-10-06 (anti-duplication audit, main-thread relief, honest configuration)
 
 ### Fixed (English first)

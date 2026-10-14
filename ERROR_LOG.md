@@ -4,6 +4,15 @@ Journal des erreurs rencontrées et corrigées. Chaque entrée documente un bug,
 
 ---
 
+## [2026-10-14 22:31] — StackOverflowError when a pending player tossed an item with a full inventory
+**Context:** Server1 (2.2.0) crashed seven seconds after a player logged in, while the restore was still pending.
+**Error:** `java.lang.StackOverflowError: Exception in server tick loop`, cycle `Player.drop` -> `CommonHooks.onPlayerTossEvent` -> `SyncPendingGuard.onToss` -> `Inventory.placeItemBackInInventory` -> `Player.drop`; the shutdown that followed hung and the watchdog killed it.
+**Root cause:** `onToss` cancels the toss and hands the stack back with `placeItemBackInInventory`, which drops whatever does not fit through `Player.drop`, firing `ItemTossEvent` again for the same pending player.
+**Fix:** 2.2.1 lets the drop made while handing a stack back through (thread-local re-entrance flag), so the overflow lands on the ground.
+**Prevention:** A handler of an event must never call code that can fire the same event for the same entity without a re-entrance guard; `placeItemBackInInventory`, `Player.drop` and `ItemHandlerHelper.giveItemToPlayer` all fire `ItemTossEvent` when the inventory is full.
+
+---
+
 ## [2026-10-06] — NeoForge attachments never restored (wrapper key)
 **Context:** 2.2.0 compatibility audit against the production mod jars.
 **Error:** every join logged `Encountered unknown or non-serializable data attachment neoforge:attachments. Skipping.`; Ars Nouveau, Iron's Spells, Apotheosis, Aether attachments never crossed servers although they were saved.
