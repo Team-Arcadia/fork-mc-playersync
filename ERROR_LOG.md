@@ -4,6 +4,36 @@ Journal des erreurs rencontrées et corrigées. Chaque entrée documente un bug,
 
 ---
 
+## [2026-11-01 12:26] — Corpses full of items deleted by Corpse's force despawn
+**Context:** players on Server1-3 reported dying with Revive Me, then finding no corpse and no items.
+**Error:** no error in any log; the Corpse death file of a forced death (2026-10-30 22:13, Server3) held 35 stacks, the corpse was gone.
+**Root cause:** `corpse-server.toml` has `corpse.despawn.force_time = 144000` on all three servers (since 2025-12-05). Corpse discards a corpse even when full once its age passes that value (`CorpseEntity.tick`, age counted while the chunk ticks, saved across visits); the default is `-1` (never). The dropped items then despawn 5 minutes later.
+**Fix:** configuration, not code: `force_time = -1` recommended. PlayerSync 2.2.2 also tells a player who died while disconnected where the corpse is.
+**Prevention:** when items "vanish with the corpse", read the corpse mod's despawn config against its defaults before touching sync code; check the Corpse death file (`world/deaths/<uuid>/`, kept `death_storage_duration` days) to prove what the corpse held.
+
+## [2026-11-01 12:26] — Every Revive Me fall ran a death save
+**Context:** 2.2.2 audit of production sync logs.
+**Error:** Server1 logged ~1400 `DEATH` saves for ~380 respawns; "Death-save (non-item) completed" appeared when a player was only downed.
+**Root cause:** with `Run_Death_Event_First=true`, Revive Me's `CommonHooksMixin.onLivingDeath` posts `LivingDeathEvent` itself, uncancelled, and turns the death into the fallen state only after every listener ran. The LOW-priority handler assumed "uncancelled = finalized death".
+**Fix:** `onPlayerDeath` queues the save with `server.tell(new TickTask(...))` and runs it only if `isDeadOrDying()` is still true after the event chain.
+**Prevention:** never treat an uncancelled death event as proof of death; check the entity state once the chain is over. `server.execute` on the server thread runs inline, use `tell`.
+
+## [2026-11-01 12:26] — One unencodable item aborted the whole save
+**Context:** Server2, 2026-10-14 00:23, logout of a player carrying an item edited with `max_stack_size=128`.
+**Error:** `IllegalStateException: Value must be within range [1;99]: 128` from `ItemStack.save` in `DeferredPlayerSnapshot.materialize`; `LOGOUT FAILED`, nothing written.
+**Root cause:** `serializeNBT` let the codec exception escape, so one slot aborted the snapshot, and every save of that player failed for as long as they carried the item.
+**Fix:** encode with `ItemStack.CODEC.encode` and, on failure, reset each component whose value does not encode on its own (`encodeRejectedItem`), then the bare item as a last resort.
+**Prevention:** a per-item failure must stay per-item on every save path; log it with the item id and the rejected component.
+
+## [2026-11-01 12:26] — Entity region scan found no entity at all
+**Context:** looking for corpse entities in `Arcadia_World/entities/*.mca` with a stdlib Python NBT reader.
+**Error:** zero entities in 177 regions; first chunk failed with `EOFError`, compression byte 4.
+**Root cause:** the world uses LZ4 region compression (type 4), which the Python standard library cannot read; the scanner only handled zlib/gzip.
+**Fix:** none needed for the investigation (the death files answered the question); a scanner must decode type 4 or say so.
+**Prevention:** check the compression byte and fail loudly on an unknown type instead of skipping chunks; validate any scanner by counting all entity ids first.
+
+---
+
 ## [2026-10-14 22:31] — StackOverflowError when a pending player tossed an item with a full inventory
 **Context:** Server1 (2.2.0) crashed seven seconds after a player logged in, while the restore was still pending.
 **Error:** `java.lang.StackOverflowError: Exception in server tick loop`, cycle `Player.drop` -> `CommonHooks.onPlayerTossEvent` -> `SyncPendingGuard.onToss` -> `Inventory.placeItemBackInInventory` -> `Player.drop`; the shutdown that followed hung and the watchdog killed it.

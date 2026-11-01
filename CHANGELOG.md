@@ -4,6 +4,44 @@ All notable changes to **PlayerSync** are documented here.
 
 ---
 
+## [2.2.2] - 2026-11-01 (Revive Me and Corpse audit)
+
+### Fixed
+
+- **Every fall was saved as a death** - Revive Me with `Run_Death_Event_First = true` fires a normal death event each time a player is downed, and only turns it into the fallen state once every mod has seen it. PlayerSync took it for a real death and wrote a death save each time: about 1400 on Server1 since September, for about 380 real respawns. The death save now waits until the event is over and only runs if the player is really dead.
+- **One item that cannot be saved blocked every save of its owner** - an item Minecraft refuses to encode (on Server2, an edited helmet with `max_stack_size = 128`) made the whole save fail. The logout of 2026-10-14 was lost, and every later save of that player would have failed as long as they carried it. The item is now saved with the rejected component reset to its default (items inside a shulker box or a bundle are repaired one by one, so the container keeps everything else), and the rest of the save goes through. The vanilla player file fails on the same item, so the rejected value could not be kept anywhere.
+- **The logout save could run before other mods were done** - it ran at the same priority as Revive Me (force death of a downed player), Arcadia Dungeon (teleport out of a run) and Corpse Curios Compat (curios handed back to the inventory), so the result depended on mod load order, and an item one of them put back after the snapshot was lost. The logout save now runs last, like the vanilla player file.
+
+### Changed
+
+- **Players who died while disconnected are told where their corpse is** - a downed player who disconnects is killed by Revive Me, and PlayerSync asks them to log in once more when they come back dead. That message read "An error occurred while creating playerEntity", with no death screen, so players believed their items had vanished. It now gives the place of death and says the items are in the corpse there when one was made (keepInventory off, Corpse or Gravestone installed), and a chat reminder follows when they are back in within 30 minutes.
+- **Restore timing in the log** - "slow restore" warned on the total time, which mostly counts the wait for the previous server on a server switch (1 to 4.5 s in production) and stalls nothing. The log now shows the time spent on the server thread, and only that triggers a warning.
+- **Quiet regular stops** - the JVM shutdown hook logged two warnings on every regular stop (`no server instance`, `could not mark server stopped`) although the regular stop had already done both jobs.
+
+### Compatibility notes
+
+- **Corpse deletes corpses that still hold items when `corpse.despawn.force_time` runs out** (`config/corpse-server.toml`). Its default is `-1` (never). At `144000`, the value found on Server1, Server2 and Server3, a corpse is removed after 2 hours spent in a loaded chunk, added up over every visit, and its items despawn 5 minutes later if nobody is there. PlayerSync cannot bring them back: the items are no longer in the database by design, the corpse holds them. Keep `-1` on a network where players come back later or from another server.
+- **A corpse stays on the server where the player died.** Arcadia Dungeon teleports a downed player out of the run before Revive Me kills them on disconnect, so the corpse can be at the dungeon return point rather than in the dungeon.
+
+### Correctifs
+
+- **Chaque chute était sauvegardée comme une mort** - Revive Me avec `Run_Death_Event_First = true` envoie un événement de mort normal chaque fois qu'un joueur tombe à terre, et ne le transforme en état « à terre » qu'après que tous les mods l'ont vu. PlayerSync le prenait pour une vraie mort et écrivait une sauvegarde de mort à chaque fois : environ 1400 sur Server1 depuis septembre, pour environ 380 vraies réapparitions. La sauvegarde de mort attend désormais la fin de l'événement et ne s'exécute que si le joueur est vraiment mort.
+- **Un objet impossible à sauvegarder bloquait toutes les sauvegardes de son propriétaire** - un objet que Minecraft refuse d'encoder (sur Server2, un casque modifié avec `max_stack_size = 128`) faisait échouer toute la sauvegarde. La déconnexion du 2026-10-14 a été perdue, et chaque sauvegarde suivante de ce joueur aurait échoué tant qu'il portait l'objet. L'objet est maintenant sauvegardé avec le composant refusé remis à sa valeur par défaut (les objets dans une shulker ou un bundle sont réparés un par un, le conteneur garde donc tout le reste), et le reste de la sauvegarde passe. Le fichier joueur vanilla échoue sur le même objet, la valeur refusée ne pouvait donc être gardée nulle part.
+- **La sauvegarde de déconnexion pouvait passer avant les autres mods** - elle tournait à la même priorité que Revive Me (mort forcée d'un joueur à terre), Arcadia Dungeon (téléportation hors d'un run) et Corpse Curios Compat (curios rendus à l'inventaire). Le résultat dépendait donc de l'ordre de chargement des mods, et un objet remis par l'un d'eux après l'instantané était perdu. La sauvegarde de déconnexion passe maintenant en dernier, comme le fichier joueur vanilla.
+
+### Changements
+
+- **Les joueurs morts pendant leur déconnexion savent où est leur corps** - un joueur à terre qui se déconnecte est tué par Revive Me, et PlayerSync lui demande de se reconnecter une fois de plus quand il revient mort. Ce message affichait « An error occurred while creating playerEntity », sans écran de mort, et les joueurs croyaient leurs objets disparus. Il donne maintenant le lieu de la mort et précise que les objets sont dans le corps à cet endroit quand un corps a été créé (keepInventory désactivé, Corpse ou Gravestone installé), et un rappel s'affiche dans le chat si le joueur revient dans les 30 minutes.
+- **Durée des restaurations dans le log** - « slow restore » se basait sur la durée totale, qui compte surtout l'attente du serveur précédent lors d'un changement de serveur (1 à 4,5 s en production) et ne bloque rien. Le log indique maintenant le temps passé sur le thread serveur, et seul ce temps déclenche un avertissement.
+- **Arrêts normaux silencieux** - le hook d'arrêt de la JVM écrivait deux avertissements à chaque arrêt normal (`no server instance`, `could not mark server stopped`) alors que l'arrêt normal avait déjà fait les deux.
+
+### Notes de compatibilité
+
+- **Corpse supprime les corps qui contiennent encore des objets quand `corpse.despawn.force_time` est écoulé** (`config/corpse-server.toml`). Sa valeur par défaut est `-1` (jamais). À `144000`, la valeur trouvée sur Server1, Server2 et Server3, un corps est supprimé après 2 heures passées dans un chunk chargé, cumulées sur toutes les visites, et ses objets disparaissent 5 minutes plus tard si personne n'est là. PlayerSync ne peut pas les rendre : par conception, les objets ne sont plus en base, c'est le corps qui les détient. Gardez `-1` sur un réseau où les joueurs reviennent plus tard ou depuis un autre serveur.
+- **Un corps reste sur le serveur où le joueur est mort.** Arcadia Dungeon téléporte un joueur à terre hors du run avant que Revive Me le tue à la déconnexion : le corps peut donc se trouver au point de retour du donjon plutôt que dans le donjon.
+
+---
+
 ## [2.2.1] - 2026-10-14 (toss guard crash fix)
 
 ### Fixed

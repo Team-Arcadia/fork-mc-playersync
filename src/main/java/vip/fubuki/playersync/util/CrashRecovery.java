@@ -39,7 +39,7 @@ public final class CrashRecovery {
 
         Thread hook = new Thread(() -> {
             try {
-                PlayerSync.LOGGER.warn("[crash-recovery] JVM shutdown hook fired — flushing pending saves");
+                PlayerSync.LOGGER.info("[crash-recovery] JVM shutdown hook fired — flushing pending saves");
                 SyncLogger.playerEvent("SYSTEM", "JVM_SHUTDOWN_HOOK", "Flushing pending saves before JVM exit");
                 if (flushCallback != null) {
                     try {
@@ -47,6 +47,13 @@ public final class CrashRecovery {
                     } catch (Throwable t) {
                         PlayerSync.LOGGER.error("[crash-recovery] flush callback threw", t);
                     }
+                }
+                // 2.2.2: a regular stop marks the server stopped itself before closing the
+                // pool, so a closed pool here means the job is done, not a failure. It used to
+                // log "could not mark server stopped" on every restart.
+                if (!JDBCsetUp.isPoolOpen()) {
+                    PlayerSync.LOGGER.info("[crash-recovery] pool already closed by the graceful stop, server already marked stopped");
+                    return;
                 }
                 // Mark this server as gracefully stopped so peers know it's dead.
                 try {

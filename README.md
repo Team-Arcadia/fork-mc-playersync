@@ -21,8 +21,8 @@ The following mods are explicitly handled by PlayerSync — their per-player sta
 * [Apothic Enchanting](https://www.curseforge.com/minecraft/mc-mods/apothic-enchanting) — DataComponents on items (CRESCENDO, CHROMATIC…)
 * [Apothic Attributes](https://www.curseforge.com/minecraft/mc-mods/apothic-attributes) — bonus attribute modifiers; the `AUX_DMG_TRACKER` attachment with `sync_attachments`
 * [Apothic Spawners](https://www.curseforge.com/minecraft/mc-mods/apothic-spawners) — world-side only, no per-player state to sync
-* [Revive Me](https://www.curseforge.com/minecraft/mc-mods/revive-me) — death event runs at LOW priority + cancel guard, fallen players are not falsely flagged as dead
-* [Corpse](https://www.curseforge.com/minecraft/mc-mods/corpse) / [Gravestone](https://www.curseforge.com/minecraft/mc-mods/gravestone-mod) (+ Curios-Compat) — dead players' curios are not overwritten with empty data
+* [Revive Me](https://www.curseforge.com/minecraft/mc-mods/revive-me) — a downed player is never treated as dead (also with `Run_Death_Event_First = true`, which fires a death event for every fall); a disconnect while downed leaves the items to the corpse instead of the database, whatever the mod load order
+* [Corpse](https://www.curseforge.com/minecraft/mc-mods/corpse) / [Gravestone](https://www.curseforge.com/minecraft/mc-mods/gravestone-mod) (+ Curios-Compat) — dead players' curios are not overwritten with empty data; a player who died while disconnected is told where their corpse is. The corpse stays on the server where the player died, and Corpse deletes a corpse that still holds items once `corpse.despawn.force_time` (in `corpse-server.toml`, counted in ticks while its chunk is loaded) runs out: keep it high on a network where players come back later or from another server
 
 Any mod still using the older **player persistent-data tag** is synced automatically (`sync_persistent_data`).
 

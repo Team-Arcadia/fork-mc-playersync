@@ -93,6 +93,12 @@ public class JDBCsetUp {
         }
     }
 
+    /** True while the pool can hand out connections (initialised and not yet closed). */
+    public static boolean isPoolOpen() {
+        HikariDataSource ds = dataSource;
+        return ds != null && !ds.isClosed();
+    }
+
     /**
      * Exposes the HikariCP MBean for monitoring. Returns {@code null} if the
      * pool is not initialised or already closed. Used by PoolStatsReporter.

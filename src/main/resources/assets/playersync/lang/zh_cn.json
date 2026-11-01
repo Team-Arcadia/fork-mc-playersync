@@ -3,5 +3,8 @@
   "playersync.item_placeholder_title": "物品券",
   "playersync.already_online": "你不能同时加入多个同步的服务器。",
   "playersync.sqlexception": "检测到Sql异常!连接已中断,请联系管理员",
-  "playersync.wrong_entity_status": "在世界中尝试创建玩家实体时发生了错误,请尝试重新进入"
+  "playersync.wrong_entity_status": "你在断线期间死亡。请重新登录以重生。",
+  "playersync.died_while_away": "你在断线期间死亡。你的物品在你的尸体中,位于 %s %s %s (%s) 附近。请重新登录。",
+  "playersync.died_while_away_at": "你在断线期间死亡,位于 %s %s %s (%s) 附近。请重新登录。",
+  "playersync.corpse_reminder": "你在断线期间死亡:你的尸体位于 %s %s %s (%s) 附近。"
 }

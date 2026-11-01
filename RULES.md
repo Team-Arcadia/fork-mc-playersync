@@ -9,7 +9,7 @@ Single source of truth for anyone (human or tooling) working on this repository.
 | Project      | PlayerSync (Team Arcadia fork)                                     |
 | Mod ID       | `playersync`                                                       |
 | Package      | `vip.fubuki.playersync`                                            |
-| Version      | 2.2.1 (VERSION LOCKED — see §3)                                    |
+| Version      | 2.2.2 (VERSION LOCKED — see §3)                                    |
 | Tech stack   | Java 21, NeoForge 21.1.x (Minecraft 1.21.1), Gradle (ModDevGradle) |
 | Storage      | MySQL / MariaDB via HikariCP                                       |
 | Authors      | mlus (upstream), Team Arcadia / vyrriox (fork maintenance)         |
@@ -41,6 +41,9 @@ Single source of truth for anyone (human or tooling) working on this repository.
   - Never write `online` without `AND last_server=?`. Periodic writes (core row, curios, mod data, containers) also require `online=1` inside the SQL itself.
   - `player_synced` is stripped at login and means "restored in THIS session"; a session without it never writes.
   - Calling a NeoForge/MC method reflectively: read its body, not just its signature (attachments wrapper bug, ERROR_LOG 2026-10-06). Before relying on an event, check that the loader actually posts it.
+  - An uncancelled `LivingDeathEvent` is not a death: Revive Me (`Run_Death_Event_First=true`) posts it for every fall. Decide after the event chain (`server.tell(new TickTask(...))`, then `isDeadOrDying()`); `server.execute` called on the server thread runs inline (ERROR_LOG 2026-11-01).
+  - Item encoding never throws out of a snapshot: one item must not abort a whole save (`serializeNBT` / `encodeRejectedItem`).
+  - `onPlayerLogout` runs at LOWEST on purpose: it saves the state the player leaves with, after other mods' logout handlers (Revive Me force death, dungeon teleports, curios hand-back).
 
 ## 4. Project Structure
 
@@ -86,6 +89,8 @@ CHANGELOG.md                 # Bilingual, strict template, most recent on top
 - [ ] Drop item + instant disconnect + reconnect — no dup (ERROR_LOG 2026-04-22)
 - [ ] Death with corpse mod + disconnect from ReviveMe fallen state (`dieOnDisconnect` both true and false) — no dup, no loss (r1-r7)
 - [ ] `keepInventory=true` death + disconnect — items preserved
+- [ ] Revive Me with `Run_Death_Event_First=true`: a fall writes no DEATH save in sync.log, a real death writes one; a disconnect while downed then a rejoin shows the corpse position
+- [ ] Carry an item with an out-of-range component (e.g. `max_stack_size` 128): logout save completes, `[item-encode]` error names the component
 - [ ] Cross-server transfer: backpack / curios / accessories / attachments follow, no dup
 - [ ] Stop the server with SIGTERM / Ctrl+C — the graceful save runs once, the emergency flush stays idle
 - [ ] `kill -9` the server — no hook runs; at next boot `CrashRecovery` clears the orphan flags; rejoin on a peer works once the heartbeat is stale

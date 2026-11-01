@@ -3,7 +3,10 @@
   "playersync.item_placeholder_title": "Item Voucher",
   "playersync.already_online": "You can't join more than one synchronization server at the same time.",
   "playersync.sqlexception": "SqlException detected!Connection lost,please contact with your admin.",
-  "playersync.wrong_entity_status": "An error occurred while creating playerEntity in the world,please login again.",
+  "playersync.wrong_entity_status": "You died while you were disconnected. Please log in again to respawn.",
+  "playersync.died_while_away": "You died while you were disconnected. Your items are in your corpse near %s %s %s (%s). Please log in again.",
+  "playersync.died_while_away_at": "You died while you were disconnected, near %s %s %s (%s). Please log in again.",
+  "playersync.corpse_reminder": "You died while you were disconnected: your corpse is near %s %s %s (%s).",
   "playersync.claim_lost": "PlayerSync: another server is finalizing your save. Please reconnect in a few seconds.",
   "playersync.sync_failed": "PlayerSync could not load your data. Nothing was lost, please reconnect.",
   "playersync.sync_pending": "Loading your data, please wait..."

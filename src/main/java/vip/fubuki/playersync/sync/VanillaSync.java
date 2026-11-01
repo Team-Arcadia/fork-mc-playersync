@@ -431,6 +431,41 @@ public class VanillaSync {
     public static Set<String> syncNotCompletedPlayer = ConcurrentHashMap.newKeySet();
 
     /**
+     * 2.2.2: where a player who logged in dead died, kept until their next restore on this
+     * server so they can be told where their corpse is. Server-local, like the corpse itself;
+     * a player who comes back after {@link #DIED_WHILE_AWAY_REMINDER_MS} gets no stale reminder.
+     */
+    private record DiedWhileAway(net.minecraft.core.GlobalPos pos, long at) {}
+    private static final ConcurrentHashMap<String, DiedWhileAway> diedWhileAway = new ConcurrentHashMap<>();
+    private static final long DIED_WHILE_AWAY_REMINDER_MS = 30 * 60_000L;
+
+    /**
+     * Kick text for a player who logged in dead, or (kick=false) the chat reminder after their
+     * next restore. The corpse is only mentioned when one was made: keepInventory off and a
+     * corpse / gravestone mod installed.
+     */
+    private static Component diedWhileAwayMessage(net.minecraft.core.GlobalPos deathPos, boolean corpse, boolean kick) {
+        if (deathPos == null) {
+            return Component.translatableWithFallback("playersync.wrong_entity_status",
+                    "You died while you were disconnected. Please log in again to respawn.");
+        }
+        BlockPos pos = deathPos.pos();
+        String dimension = deathPos.dimension().location().toString();
+        if (!kick) {
+            return Component.translatableWithFallback("playersync.corpse_reminder",
+                    "You died while you were disconnected: your corpse is near %s %s %s (%s).",
+                    pos.getX(), pos.getY(), pos.getZ(), dimension).withStyle(ChatFormatting.GOLD);
+        }
+        return corpse
+                ? Component.translatableWithFallback("playersync.died_while_away",
+                        "You died while you were disconnected. Your items are in your corpse near %s %s %s (%s). Please log in again.",
+                        pos.getX(), pos.getY(), pos.getZ(), dimension)
+                : Component.translatableWithFallback("playersync.died_while_away_at",
+                        "You died while you were disconnected, near %s %s %s (%s). Please log in again.",
+                        pos.getX(), pos.getY(), pos.getZ(), dimension);
+    }
+
+    /**
      * 2.2.0: identity of the login a background join task is working for. A fresh token is
      * installed on the main thread when PlayerLoggedInEvent fires and removed when that
      * player logs out. The join task polls for minutes in the worst case, so it must be able
@@ -630,6 +665,21 @@ public class VanillaSync {
             server.execute(() -> {
                 if (!isJoinSessionCurrent(player_uuid, session)) return;
                 deadPlayerWhileLogging.add(player_uuid);
+                // 2.2.2: this is the player Revive Me killed when they disconnected while
+                // downed. They never saw a death screen, so say where the corpse is instead of
+                // an "error" kick, and remind them once the next login has restored them.
+                Optional<net.minecraft.core.GlobalPos> deathPos = serverPlayer.getLastDeathLocation();
+                boolean corpse;
+                try {
+                    corpse = !serverPlayer.serverLevel().getGameRules()
+                            .getBoolean(net.minecraft.world.level.GameRules.RULE_KEEPINVENTORY)
+                            && (ModList.get().isLoaded("corpse") || ModList.get().isLoaded("gravestone"));
+                } catch (Exception e) {
+                    corpse = false; // neutral wording when unsure
+                }
+                if (corpse) {
+                    deathPos.ifPresent(pos -> diedWhileAway.put(player_uuid, new DiedWhileAway(pos, System.currentTimeMillis())));
+                }
                 serverPlayer.removeTag("player_synced");
                 ResourceKey<Level> respawnLevel = serverPlayer.getRespawnDimension();
                 BlockPos respawnPos = serverPlayer.getRespawnPosition();
@@ -640,7 +690,7 @@ public class VanillaSync {
                     }
                 }
                 serverPlayer.setHealth(1);
-                serverPlayer.connection.disconnect(Component.translatableWithFallback("playersync.wrong_entity_status","An error occurred while creating playerEntity in the world,please login again."));
+                serverPlayer.connection.disconnect(diedWhileAwayMessage(deathPos.orElse(null), corpse, true));
             });
             // online=1 already set by onPlayerLoggedInKickCheck — no duplicate DB write here
             return;
@@ -1070,6 +1120,7 @@ public class VanillaSync {
             // per player). This is acceptable because players join one at a time, not 35 at once.
             // The real performance fix is staggering the auto-save (see onServerTick).
             server.execute(() -> {
+                final long applyT0 = System.currentTimeMillis();
                 // 2.2.0: the sync-pending flag is only lifted once the restore really
                 // happened. A restore that throws half-way used to lift it anyway, leaving
                 // the player with a partially restored inventory that the next save wrote
@@ -1260,12 +1311,22 @@ public class VanillaSync {
 
                     serverPlayer.addTag("player_synced");
                     completed = true;
-                    long totalRestore = System.currentTimeMillis() - restoreT0;
-                    PlayerSync.LOGGER.info("Sync data for player {} completed in {}ms", player_uuid, totalRestore);
+                    DiedWhileAway awayDeath = diedWhileAway.remove(player_uuid);
+                    if (awayDeath != null && System.currentTimeMillis() - awayDeath.at() < DIED_WHILE_AWAY_REMINDER_MS) {
+                        serverPlayer.sendSystemMessage(diedWhileAwayMessage(awayDeath.pos(), true, false));
+                    }
+                    long now = System.currentTimeMillis();
+                    long totalRestore = now - restoreT0;
+                    long mainThreadMs = now - applyT0;
+                    PlayerSync.LOGGER.info("Sync data for player {} completed in {}ms ({}ms on the server thread)",
+                            player_uuid, totalRestore, mainThreadMs);
                     SyncLogger.restoreCompleted(player_uuid, totalRestore);
-                    if (totalRestore > 1000) {
-                        PlayerSync.LOGGER.warn("[perf-restore] slow restore for {} ({}ms) — enable log level=TRACE to profile",
-                                player_uuid, totalRestore);
+                    // 2.2.2: the total includes the wait for the previous server's logout save,
+                    // which is expected on a server switch and costs nothing here. Only time
+                    // spent on the server thread stalls the tick, so only that is a warning.
+                    if (mainThreadMs > 250) {
+                        PlayerSync.LOGGER.warn("[perf-restore] restore of {} held the server thread {}ms ({}ms in total)",
+                                player_uuid, mainThreadMs, totalRestore);
                     }
                 } catch (Exception e) {
                     PlayerSync.LOGGER.error("Error applying sync data for player {}", player_uuid, e);
@@ -2118,7 +2179,13 @@ public class VanillaSync {
         try {
             MinecraftServer server = ServerLifecycleHooks.getCurrentServer();
             if (server == null) {
-                PlayerSync.LOGGER.warn("[emergency-flush] no server instance — nothing to flush");
+                // 2.2.2: the normal case on every regular stop (the server is gone once the hook
+                // runs); it used to be a WARN on every restart of every server.
+                if (gracefulShutdownDone.getCount() == 0) {
+                    PlayerSync.LOGGER.info("[emergency-flush] graceful shutdown already saved every player, nothing to flush");
+                } else {
+                    PlayerSync.LOGGER.warn("[emergency-flush] no server instance — nothing to flush");
+                }
                 return;
             }
             // On SIGINT / SIGTERM the server's own hook starts the graceful stop within a
@@ -2184,8 +2251,15 @@ public class VanillaSync {
      *
      * All branches now properly clean up syncNotCompletedPlayer + removePlayerLock
      * (previously leaked in the dead/sync-not-completed branches).
+     *
+     * <p>2.2.2: LOWEST priority. The save describes the state the player leaves with, after
+     * every other mod's logout handler: Revive Me's force death of a downed player (NORMAL),
+     * Arcadia Dungeon's teleport out of a run (NORMAL), Corpse Curios Compat handing delayed
+     * curios back to the inventory (NORMAL). At NORMAL the order against them depended on mod
+     * load order, and an item another handler put into the inventory after our snapshot was
+     * lost. Vanilla writes the .dat file after the event as well, so both copies now agree.
      */
-    @SubscribeEvent
+    @SubscribeEvent(priority = net.neoforged.bus.api.EventPriority.LOWEST)
     public static void onPlayerLogout(PlayerEvent.PlayerLoggedOutEvent event) {
         String player_uuid = event.getEntity().getUUID().toString();
         // Any join task still running for this login now knows its player is gone.
@@ -2234,17 +2308,21 @@ public class VanillaSync {
         //   - Corpse mod (DeathEvents) creates the corpse on LivingDropsEvent; its
         //     curios / cosmetic compat mods pull those items into the corpse too.
         // So on a disconnect from the fallen state the player's items are bound for a
-        // corpse. If PlayerSync's normal logout-save wrote the still-attached inventory
-        // (it runs at NORMAL priority — ordering vs ReviveMe's onLogout is undefined),
+        // corpse. If PlayerSync's normal logout-save wrote the still-attached inventory,
         // the rejoining player would get the DB copy AND the corpse would hold one =
         // duplication.
         //
         // Detection is EXACT (no heuristics): the player is fallen iff Revive Me's
-        // FallenData.isFallen() says so; or already dead iff isDeadOrDying(). Either
-        // state — regardless of whether PlayerSync's handler ran before or after
-        // ReviveMe's forceDeath — means the items are corpse-bound. We clear every
-        // item-bearing DB column (inventory / armor / left_hand / cursors / curios /
-        // accessories / cosmetic_armor) so the corpse is the single source of truth.
+        // FallenData.isFallen() says so; or already dead iff isDeadOrDying(). Since 2.2.2
+        // this handler runs at LOWEST, after Revive Me's onLogout, so with
+        // Die_On_Disconnect=true the player is normally seen dead with the corpse already
+        // in the world (verified 2026-10-30: the Corpse death file of a forced death held
+        // the full inventory). A player still fallen here was downed in the same tick
+        // (Revive Me's canDieThisTick) or the server runs Die_On_Disconnect=false: the
+        // items stay in the .dat and turn into a corpse when the fall resolves. Either
+        // way we clear every item-bearing DB column (inventory / armor / left_hand /
+        // cursors / curios / accessories / cosmetic_armor) so the corpse, or the .dat
+        // that will become one, is the single source of truth.
         //
         // The matching JOIN-side guard (doPlayerJoin skips the data apply when the
         // rejoining player is still fallen) ensures the dieOnDisconnect=false path —
@@ -2637,11 +2715,91 @@ public class VanillaSync {
         if (itemStack == null || itemStack.isEmpty()) {
             return new CompoundTag();
         }
-        // Serialize the ItemStack to NBT
+        // Serialize the ItemStack to NBT (same codec call as ItemStack.save, without the throw)
         HolderLookup.Provider provider = ServerLifecycleHooks.getCurrentServer().registryAccess();
-        Tag compoundTag;
-        compoundTag = itemStack.save(provider);
-        return compoundTag;
+        net.minecraft.resources.RegistryOps<Tag> ops = provider.createSerializationContext(net.minecraft.nbt.NbtOps.INSTANCE);
+        com.mojang.serialization.DataResult<Tag> encoded = ItemStack.CODEC.encode(itemStack, ops, new CompoundTag());
+        Optional<Tag> tag = encoded.result();
+        if (tag.isPresent()) return tag.get();
+        return encodeRejectedItem(itemStack, ops,
+                encoded.error().map(com.mojang.serialization.DataResult.Error::message).orElse("unknown"));
+    }
+
+    /**
+     * 2.2.2: writes an item the codec refuses as close to the original as Minecraft allows
+     * (see {@link #repairForEncoding}) and logs what had to change.
+     *
+     * <p>Before, {@code ItemStack.save} threw out of the snapshot and aborted the whole save:
+     * Server2 lost a logout on 2026-10-14 to an item edited with {@code max_stack_size=128}, and
+     * every save of that player kept failing for as long as they carried it. The vanilla .dat
+     * save fails on the same item, so the rejected part could not be kept anywhere anyway.
+     */
+    private static Tag encodeRejectedItem(ItemStack stack, net.minecraft.resources.RegistryOps<Tag> ops, String reason) {
+        String itemId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+        List<String> changes = new ArrayList<>();
+        Optional<Tag> tag = ItemStack.CODEC.encode(repairForEncoding(stack, ops, changes, 0), ops, new CompoundTag()).result();
+        if (tag.isPresent()) {
+            PlayerSync.LOGGER.error("[item-encode] {} x{} could not be saved as is ({}); saved with: {}",
+                    itemId, stack.getCount(), reason, changes);
+            return tag.get();
+        }
+        // Unreachable for a registered item: keep the pre-2.2.2 behaviour (the save is aborted
+        // and the database keeps its last good copy) rather than write the slot as empty.
+        throw new IllegalStateException("Cannot encode " + itemId + ": " + reason);
+    }
+
+    /**
+     * Returns a copy the codec accepts, keeping as much of the item as possible. Items inside
+     * shulker or bundle contents are repaired one by one, so one bad item does not empty its
+     * container; any other component whose value does not encode is reset to the item's
+     * default; a count above 99 is cut to 99; the bare item is the last resort.
+     */
+    private static ItemStack repairForEncoding(ItemStack stack, net.minecraft.resources.RegistryOps<Tag> ops,
+                                               List<String> changes, int depth) {
+        if (stack.isEmpty() || ItemStack.CODEC.encode(stack, ops, new CompoundTag()).result().isPresent()) return stack;
+        String itemId = BuiltInRegistries.ITEM.getKey(stack.getItem()).toString();
+        ItemStack fixed = stack.copy();
+        for (Map.Entry<net.minecraft.core.component.DataComponentType<?>, Optional<?>> entry
+                : stack.getComponentsPatch().entrySet()) {
+            if (entry.getValue().isEmpty() || componentEncodes(entry.getKey(), entry.getValue().get(), ops)) continue;
+            Object value = entry.getValue().get();
+            if (depth < 4 && value instanceof net.minecraft.world.item.component.ItemContainerContents contents) {
+                net.minecraft.core.NonNullList<ItemStack> items =
+                        net.minecraft.core.NonNullList.withSize(contents.getSlots(), ItemStack.EMPTY);
+                contents.copyInto(items);
+                for (int i = 0; i < items.size(); i++) {
+                    items.set(i, repairForEncoding(items.get(i), ops, changes, depth + 1));
+                }
+                fixed.set(DataComponents.CONTAINER, net.minecraft.world.item.component.ItemContainerContents.fromItems(items));
+                if (componentEncodes(DataComponents.CONTAINER, fixed.get(DataComponents.CONTAINER), ops)) continue;
+            } else if (depth < 4 && value instanceof net.minecraft.world.item.component.BundleContents bundle) {
+                List<ItemStack> items = new ArrayList<>();
+                for (ItemStack inner : bundle.itemsCopy()) {
+                    items.add(repairForEncoding(inner, ops, changes, depth + 1));
+                }
+                fixed.set(DataComponents.BUNDLE_CONTENTS, new net.minecraft.world.item.component.BundleContents(items));
+                if (componentEncodes(DataComponents.BUNDLE_CONTENTS, fixed.get(DataComponents.BUNDLE_CONTENTS), ops)) continue;
+            }
+            fixed = new ItemStack(fixed.getItemHolder(), fixed.getCount(),
+                    fixed.getComponentsPatch().forget(entry.getKey()::equals));
+            changes.add(itemId + " " + BuiltInRegistries.DATA_COMPONENT_TYPE.getKey(entry.getKey()) + " reset to default");
+        }
+        if (ItemStack.CODEC.encode(fixed, ops, new CompoundTag()).result().isPresent()) return fixed;
+        if (fixed.getCount() > 99) {
+            changes.add(itemId + " count " + fixed.getCount() + " cut to 99");
+            fixed = fixed.copyWithCount(99);
+            if (ItemStack.CODEC.encode(fixed, ops, new CompoundTag()).result().isPresent()) return fixed;
+        }
+        changes.add(itemId + " saved without its data");
+        return new ItemStack(stack.getItemHolder(), Math.min(stack.getCount(), 99));
+    }
+
+    private static <T> boolean componentEncodes(net.minecraft.core.component.DataComponentType<T> type, Object value,
+                                                net.minecraft.resources.RegistryOps<Tag> ops) {
+        com.mojang.serialization.Codec<T> codec = type.codec();
+        if (codec == null) return true; // transient component: never written
+        @SuppressWarnings("unchecked") T typed = (T) value;
+        return codec.encodeStart(ops, typed).result().isPresent();
     }
 
     /**
@@ -3413,14 +3571,31 @@ public class VanillaSync {
         return totalXp;
     }
 
-    // FIX COMPAT: priority=LOW so we run after revive mods (Revive Me / HardcoreRevival
-    // / CorailTombstone) that cancel LivingDeathEvent at NORMAL/HIGH priority. NeoForge
-    // bus 8.x skips canceled events at the @SubscribeEvent dispatcher level, so this
-    // handler runs ONLY for un-canceled (real, finalized) deaths — exactly when the
-    // death-save (non-item progression) should fire.
+    // FIX COMPAT: priority=LOW so we run after revive mods (HardcoreRevival / CorailTombstone)
+    // that cancel LivingDeathEvent at NORMAL/HIGH priority; NeoForge bus 8.x skips canceled
+    // events at the @SubscribeEvent dispatcher level.
+    //
+    // 2.2.2: an uncancelled LivingDeathEvent is still not a death. Revive Me with
+    // Run_Death_Event_First=true (the production setting) posts the event itself, uncancelled,
+    // every time a player is downed, and only turns the death into the fallen state once every
+    // listener has run (CommonHooksMixin.onLivingDeath, read from the 5.10.0 bytecode). At this
+    // point a downed player and a dying one are indistinguishable, so the decision waits until
+    // the event chain is over: the death-save runs only if the player is still dead then.
+    // Production logged ~1400 "death" saves on Server1 for ~380 real respawns.
     @SubscribeEvent(priority = net.neoforged.bus.api.EventPriority.LOW)
     public static void onPlayerDeath(LivingDeathEvent event) {
         if (!(event.getEntity() instanceof ServerPlayer player)) return;
+        MinecraftServer server = player.getServer();
+        if (server == null) return;
+        // tell() always queues; execute() would run inline since we are on the server thread.
+        server.tell(new net.minecraft.server.TickTask(server.getTickCount(), () -> deathSave(player)));
+    }
+
+    private static void deathSave(ServerPlayer player) {
+        // Downed by Revive Me, saved by a totem, or the death was cancelled further down the
+        // chain: the player is alive, nothing died. A player who left in the meantime (Revive
+        // Me's force death runs inside the logout) belongs to the logout path.
+        if (!player.isDeadOrDying() || player.hasDisconnected() || player.isRemoved()) return;
         String puuid = player.getUUID().toString();
 
         if (deadPlayerWhileLogging.contains(puuid)) return;
@@ -3436,9 +3611,9 @@ public class VanillaSync {
         // on disconnect and captures the post-respawn state.
         if (!JdbcConfig.SAVE_ON_DEATH.get()) return;
 
-        // Immediately save ALL player data on death (snapshot + async).
-        // LivingDeathEvent fires BEFORE vanilla items are dropped, so the snapshot
-        // captures whatever keeping-charms have already reserved + the rest.
+        // Save the non-item progression right after the death (snapshot + async). Since
+        // 2.2.2 this runs once the death and its drops are processed, so every death handler
+        // (Corail Tombstone knowledge, keeping charms) has already done its work.
         // This protects against: server crash after death, network disconnect before
         // onPlayerLogout fires, or any scenario where the logout handler is skipped.
         // The normal logout save will overwrite this with the final post-death state.
